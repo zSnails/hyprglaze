@@ -1,8 +1,13 @@
 const std = @import("std");
 const toml = @import("toml");
 const iohelp = @import("io_helper.zig");
+const workspace_slide = @import("workspace_slide.zig");
 
 const log = std.log.scoped(.config);
+
+/// Workspace-slide override. `auto` mirrors whatever animation is
+/// detected from Hyprland; the rest force an axis or disable sliding.
+pub const WorkspaceSlideOverride = enum { auto, horizontal, vertical, none };
 
 /// Generic key-value params for effects to read from their config section.
 /// Avoids coupling effects to the Config struct.
@@ -76,6 +81,15 @@ pub const Config = struct {
     transition_duration: f32,
     cursor_smoothing: f32,
     geometry_smoothing: f32,
+    /// `[transition] workspace_slide` — axis override, default auto.
+    workspace_slide: WorkspaceSlideOverride,
+    /// `[transition] workspace_duration` — seconds; 0 = auto (detected
+    /// from Hyprland's animation speed). Bezier easing only.
+    workspace_duration: f32,
+    /// `[transition] workspace_spring = "mass,stiffness,dampening"` —
+    /// mirrors a custom `hl.curve` spring (Hyprland does not expose
+    /// spring parameters over IPC). null = hyprutils defaults.
+    workspace_spring: ?workspace_slide.Spring,
     config_path: []const u8,
 
     /// Arena that owns every string slice inside `raw_table` (and hence
@@ -145,10 +159,45 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8, source_path: []cons
         .transition_duration = transition_params.getFloat("duration", 0.3),
         .cursor_smoothing = cursor_params.getFloat("smoothing", 0.15),
         .geometry_smoothing = geometry_params.getFloat("smoothing", 0.12),
+        .workspace_slide = parseSlideOverride(transition_params.getString("workspace_slide", null)),
+        .workspace_duration = transition_params.getFloat("workspace_duration", 0),
+        .workspace_spring = parseSpring(transition_params.getString("workspace_spring", null)),
         .config_path = try allocator.dupe(u8, source_path),
         .raw_arena = result.arena,
         .raw_table = t,
     };
+}
+
+fn parseSlideOverride(value: ?[]const u8) WorkspaceSlideOverride {
+    const s = value orelse return .auto;
+    return std.meta.stringToEnum(WorkspaceSlideOverride, s) orelse {
+        log.warn("unknown workspace_slide '{s}' — using auto", .{s});
+        return .auto;
+    };
+}
+
+/// "mass,stiffness,dampening" → Spring; anything malformed → null.
+fn parseSpring(value: ?[]const u8) ?workspace_slide.Spring {
+    const s = std.mem.trim(u8, value orelse return null, " \t");
+    if (s.len == 0) return null;
+    var it = std.mem.splitScalar(u8, s, ',');
+    const mass = parseSpringField(it.next()) orelse return warnSpring(s);
+    const stiffness = parseSpringField(it.next()) orelse return warnSpring(s);
+    const damping = parseSpringField(it.next()) orelse return warnSpring(s);
+    if (it.next() != null) return warnSpring(s);
+    return .{ .mass = mass, .stiffness = stiffness, .damping = damping };
+}
+
+fn parseSpringField(field: ?[]const u8) ?f32 {
+    const f = std.mem.trim(u8, field orelse return null, " \t");
+    const v = std.fmt.parseFloat(f32, f) catch return null;
+    if (!std.math.isFinite(v) or v <= 0) return null;
+    return v;
+}
+
+fn warnSpring(s: []const u8) ?workspace_slide.Spring {
+    log.warn("invalid workspace_spring '{s}' (want \"mass,stiffness,dampening\") — using defaults", .{s});
+    return null;
 }
 
 /// Get effect-specific params from a TOML section by name
@@ -332,6 +381,38 @@ test "parse config defaults when fields missing" {
     try std.testing.expectEqualStrings("particles", cfg.effect);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), cfg.transition_duration, 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.15), cfg.cursor_smoothing, 0.001);
+    try std.testing.expectEqual(WorkspaceSlideOverride.auto, cfg.workspace_slide);
+    try std.testing.expectEqual(@as(f32, 0), cfg.workspace_duration);
+    try std.testing.expectEqual(@as(?workspace_slide.Spring, null), cfg.workspace_spring);
+}
+
+test "parse workspace slide overrides" {
+    // Suppress the intentional bad-value warnings on a green run.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
+    const src =
+        \\[transition]
+        \\workspace_slide = "none"
+        \\workspace_duration = 0.6
+        \\workspace_spring = "1, 71.26, 15.83"
+        \\
+    ;
+    var cfg = try parse(std.testing.allocator, src, "/tmp/ws.toml");
+    defer deinit(&cfg, std.testing.allocator);
+
+    try std.testing.expectEqual(WorkspaceSlideOverride.none, cfg.workspace_slide);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), cfg.workspace_duration, 0.001);
+    const sp = cfg.workspace_spring.?;
+    try std.testing.expectApproxEqAbs(@as(f32, 71.26), sp.stiffness, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 15.83), sp.damping, 0.001);
+
+    // Unknown mode and malformed springs degrade, not fail.
+    try std.testing.expectEqual(WorkspaceSlideOverride.auto, parseSlideOverride("diagonal"));
+    try std.testing.expectEqual(@as(?workspace_slide.Spring, null), parseSpring("1,2"));
+    try std.testing.expectEqual(@as(?workspace_slide.Spring, null), parseSpring("a,b,c"));
+    try std.testing.expectEqual(@as(?workspace_slide.Spring, null), parseSpring("1,-5,3"));
+    try std.testing.expectEqual(@as(?workspace_slide.Spring, null), parseSpring("1,2,3,4"));
 }
 
 test "parse invalid toml returns error" {

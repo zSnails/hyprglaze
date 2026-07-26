@@ -112,7 +112,7 @@ pub const TransitionState = struct {
 
 /// Convert a per-frame smoothing factor to a frame-rate independent alpha.
 /// Factor is tuned for 30fps: 0 = instant, 1 = frozen.
-fn smoothAlpha(factor: f32, dt: f32) f32 {
+pub fn smoothAlpha(factor: f32, dt: f32) f32 {
     const f = std.math.clamp(factor, 0.001, 0.999);
     const speed = -@log(f) * 30.0;
     return 1.0 - @exp(-speed * dt);

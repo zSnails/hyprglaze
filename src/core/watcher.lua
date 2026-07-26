@@ -5,9 +5,12 @@
 -- Pushes compact events onto socket2 (`custom>>hg:...`) so the daemon
 -- never has to poll `.socket.sock`:
 --   hg:cur:<x>,<y>              cursor moved (floored layout coords)
---   hg:geo:<records>            visible-window set or geometry changed;
---                               records joined by \30, fields by \31:
+--   hg:geo:<wsid>\29<records>   active workspace id + visible windows,
+--                               emitted when either changed; records
+--                               joined by \30, fields by \31:
 --                               addr \31 x \31 y \31 w \31 h \31 class \31 title
+--                               wsid rides with the geometry so workspace
+--                               identity and window set stay atomic
 --   hg:hb                       heartbeat, every 128 ticks (~2s)
 --
 -- Class/title are stripped of control characters (so they can never
@@ -20,7 +23,7 @@ if __hyprglaze and __hyprglaze.t then
 end
 __hyprglaze = {}
 
-local FS, RS = string.char(31), string.char(30)
+local FS, RS, GS = string.char(31), string.char(30), string.char(29)
 local last_geo, last_cx, last_cy, ticks = nil, nil, nil, 0
 
 local function clean(s)
@@ -35,8 +38,12 @@ __hyprglaze.t = hl.timer(function()
         hl.dispatch(hl.dsp.event("hg:cur:" .. cx .. "," .. cy))
     end
 
+    local ws = hl.get_active_workspace()
+    -- ws.id may be a Lua float (like w.at/w.size); %.0f avoids "4.0".
+    local wsid = string.format("%.0f", (type(ws) == "number" and ws) or (ws and ws.id) or 0)
+
     local parts = {}
-    for _, w in ipairs(hl.get_windows({ workspace = hl.get_active_workspace(), mapped = true })) do
+    for _, w in ipairs(hl.get_windows({ workspace = ws, mapped = true })) do
         if w.visible then
             parts[#parts + 1] = table.concat({
                 w.address,
@@ -49,7 +56,9 @@ __hyprglaze.t = hl.timer(function()
             }, FS)
         end
     end
-    local geo = table.concat(parts, RS)
+    -- Compare wsid + records together: a switch between two identically
+    -- laid out (e.g. both empty) workspaces must still emit.
+    local geo = wsid .. GS .. table.concat(parts, RS)
     if geo ~= last_geo then
         last_geo = geo
         hl.dispatch(hl.dsp.event("hg:geo:" .. geo))

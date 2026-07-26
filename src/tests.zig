@@ -5,4 +5,5 @@ test {
     _ = @import("core/hypr_events.zig");
     _ = @import("core/transition.zig");
     _ = @import("core/hypr.zig");
+    _ = @import("core/workspace_slide.zig");
 }

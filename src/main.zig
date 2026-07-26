@@ -7,6 +7,7 @@ const shader_mod = @import("core/shader.zig");
 const hypr = @import("core/hypr.zig");
 const palette_mod = @import("core/palette.zig");
 const transition = @import("core/transition.zig");
+const workspace_slide = @import("core/workspace_slide.zig");
 const config_mod = @import("core/config.zig");
 const watcher_mod = @import("core/watcher.zig");
 const hypr_events = @import("core/hypr_events.zig");
@@ -132,6 +133,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
     log.info("monitor: {d}x{d} scale={d:.2}", .{ mon.width, mon.height, mon.scale });
 
+    // Detect Hyprland's workspace animation so switches mirror the
+    // compositor's own slide (direction, duration, easing). Refreshed on
+    // Hyprland config reloads; config overrides applied on top.
+    var detected_anim: ?hypr.WorkspaceAnim = ipc.workspaceAnim(allocator) catch |err| blk: {
+        log.warn("workspace animation detection failed: {} — using defaults", .{err});
+        break :blk null;
+    };
+
     // Subscribe to Hyprland's event stream so focus / lifecycle / workspace
     // changes are instant rather than detected via the every-100ms poll.
     var events = hypr_events.HyprEvents.init() catch |err| {
@@ -190,6 +199,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     trans.transition_duration = cfg.transition_duration;
     trans.cursor_smoothing = cfg.cursor_smoothing;
     trans.geometry_smoothing = cfg.geometry_smoothing;
+
+    // Workspace slide state + the outgoing window set captured at each
+    // workspace switch (slides off-screen while the new set slides in).
+    var slide = workspace_slide.WorkspaceSlide{};
+    configureSlide(&slide, detected_anim, &cfg);
+    switch (slide.ease) {
+        .spring => |sp| log.info("workspace slide: {s}, spring k={d:.1} c={d:.1} m={d:.1}", .{
+            @tagName(slide.axis), sp.stiffness, sp.damping, sp.mass,
+        }),
+        .cubic_bezier => log.info("workspace slide: {s}, bezier, {d:.0}ms", .{
+            @tagName(slide.axis), slide.duration * 1000.0,
+        }),
+    }
+    var outgoing_windows: [hypr.max_visible_windows]shader_mod.ShaderProgram.WindowRect = undefined;
+    var outgoing_info: [hypr.max_visible_windows]effects.WindowInfo = undefined;
+    var outgoing_count: u8 = 0;
 
     // Config watcher
     var config_watcher: ?watcher_mod.FileWatcher = null;
@@ -256,6 +281,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cached_snapshot = hypr.VisibleWindows{};
     var last_snapshot_gen = events.snapshotGen();
     events.copySnapshot(&cached_snapshot);
+    slide.seed(cached_snapshot.workspace_id);
 
     const raw0 = deriveRawState(&cached_snapshot, surf_h, initial_addr);
     trans.seed(raw0.win, seed_cursor, raw0.win_address);
@@ -321,6 +347,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 reloadConfig(allocator, &cfg, &effect, &shader_prog, &pal, &trans, &shader_path_expanded, surf_w, surf_h) catch |err| {
                     log.warn("reload failed: {}", .{err});
                 };
+                configureSlide(&slide, detected_anim, &cfg);
             }
         }
 
@@ -365,6 +392,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 installWatcher(&ipc, &events) catch |err| {
                     log.warn("watcher reinstall failed: {} — retrying in {d}s", .{ err, @as(u32, @intFromFloat(reinstall_min_gap)) });
                 };
+                if (dirty.config) {
+                    // The reload may have changed the workspace animation.
+                    detected_anim = ipc.workspaceAnim(allocator) catch detected_anim;
+                    configureSlide(&slide, detected_anim, &cfg);
+                }
             }
 
             // Re-derive window state when the watcher pushed a new
@@ -372,10 +404,28 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // drag/resize the in-compositor watcher sees geometry change
             // every 16ms tick and pushes a fresh snapshot.
             const gen = events.snapshotGen();
+            var force_snap = false;
             if (focus_changed or gen != last_snapshot_gen) {
                 if (gen != last_snapshot_gen) {
                     last_snapshot_gen = gen;
                     events.copySnapshot(&cached_snapshot);
+                    // Workspace switch? Capture the currently *displayed*
+                    // set as the outgoing side of the slide — before the
+                    // re-derive below overwrites cached_window_info. Using
+                    // the displayed (composed) set makes a mid-slide
+                    // retarget visually continuous for free.
+                    switch (slide.noteWorkspace(cached_snapshot.workspace_id, time_f64)) {
+                        .slide => {
+                            outgoing_count = cached_window_count;
+                            @memcpy(outgoing_windows[0..outgoing_count], cached_windows[0..outgoing_count]);
+                            @memcpy(outgoing_info[0..outgoing_count], cached_window_info[0..outgoing_count]);
+                        },
+                        // Workspace changed without a slidable direction
+                        // (special workspace, unknown id, slides off):
+                        // snap — never glide across a workspace boundary.
+                        .snap => force_snap = true,
+                        .none => {},
+                    }
                 }
                 const raw = deriveRawState(&cached_snapshot, surf_h, cached_win_address);
                 target_window_count = raw.window_count;
@@ -396,21 +446,66 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     cached_focused_title_len = raw.focused_title_len;
                 }
             }
-            trans.update(time_f64, cached_raw_win, raw_cursor, cached_win_address);
+            // Sample the slide once per frame (it self-deactivates when
+            // the easing settles); both the focused-window rect and the
+            // composed window list below reuse the same offsets.
+            const span: f32 = if (slide.axis == .vertical) surf_h else surf_w;
+            const slide_off = slide.sample(time_f64, span);
+
+            // While sliding, keep iWindow tracking the focused window's
+            // slid-in position instead of pre-snapping to where it will
+            // come to rest.
+            var raw_focus_win = cached_raw_win;
+            if (slide_off) |off| {
+                for (0..target_window_count) |i| {
+                    if (target_windows[i].address != 0 and target_windows[i].address == cached_win_address) {
+                        applyOffset(&raw_focus_win.x, &raw_focus_win.y, off, off.incoming);
+                        break;
+                    }
+                }
+            }
+            trans.update(time_f64, raw_focus_win, raw_cursor, cached_win_address);
 
             // Smooth all window positions toward targets
-            const gs = @max(cfg.geometry_smoothing, @as(f32, 0.001));
-            const win_speed = -@log(gs) * 30.0;
-            const win_alpha = 1.0 - @exp(-win_speed * dt);
+            const win_alpha = transition.smoothAlpha(cfg.geometry_smoothing, dt);
 
-            // Match target windows to cached windows by nearest position
-            // (Hyprland can reorder windows on focus change)
-            if (target_window_count != cached_window_count) {
-                // Window count changed — snap all
+            if (slide_off) |off| {
+                // Workspace slide: compose incoming windows (sliding in)
+                // with the captured outgoing set (sliding out). Positions
+                // are analytic — per-frame smoothing is bypassed.
+                var n: u8 = 0;
+                for (0..target_window_count) |i| {
+                    cached_windows[n] = target_windows[i];
+                    applyOffset(&cached_windows[n].x, &cached_windows[n].y, off, off.incoming);
+                    n += 1;
+                }
+                // A window carried along with the switch (movetoworkspace
+                // with follow) is already in the incoming set — skip its
+                // outgoing copy so every address stays unique.
+                outer: for (0..outgoing_count) |i| {
+                    if (n >= hypr.max_visible_windows) break;
+                    if (outgoing_windows[i].address != 0) {
+                        for (0..target_window_count) |ti| {
+                            if (outgoing_windows[i].address == target_windows[ti].address) continue :outer;
+                        }
+                    }
+                    cached_windows[n] = outgoing_windows[i];
+                    applyOffset(&cached_windows[n].x, &cached_windows[n].y, off, off.outgoing);
+                    cached_window_info[n] = outgoing_info[i];
+                    n += 1;
+                }
+                cached_window_count = n;
+            } else if (target_window_count != cached_window_count or force_snap) {
+                // Window count changed (also the first frame after a slide
+                // settles, offsets ≈ 0) or a workspace boundary without a
+                // slide — snap all
                 for (0..target_window_count) |i| cached_windows[i] = target_windows[i];
                 cached_window_count = target_window_count;
+                outgoing_count = 0;
             } else {
-                // Same count — match each target to nearest cached window
+                // Same count within one workspace — match each target to
+                // the nearest cached window and smooth toward it
+                // (Hyprland can reorder windows on focus change).
                 var used: [hypr.max_visible_windows]bool = [_]bool{false} ** hypr.max_visible_windows;
                 var matched_targets: [hypr.max_visible_windows]shader_mod.ShaderProgram.WindowRect = undefined;
 
@@ -465,6 +560,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .focused_title = cached_focused_title,
                 .focused_title_len = cached_focused_title_len,
                 .palette = if (pal) |*p| p else null,
+                .workspace_slide = slide.progress(time_f64),
             });
             effect.upload(&shader_prog);
 
@@ -569,6 +665,43 @@ fn cacheWindows(
             .w = raw.windows[i].w,
             .h = raw.windows[i].h,
         };
+    }
+}
+
+/// Resolve the effective slide behavior: what Hyprland's animation
+/// config dictates, overridden by `[transition]` settings. Called at
+/// startup, on Hyprland config reloads (fresh detection), and on TOML
+/// hot-reloads (fresh overrides).
+fn configureSlide(
+    slide: *workspace_slide.WorkspaceSlide,
+    detected: ?hypr.WorkspaceAnim,
+    cfg: *const config_mod.Config,
+) void {
+    if (detected) |d| {
+        slide.axis = d.axis;
+        slide.duration = d.duration;
+        slide.ease = d.ease;
+    } else {
+        slide.* = .{ .last_ws_id = slide.last_ws_id };
+    }
+    switch (cfg.workspace_slide) {
+        .auto => {},
+        .horizontal => slide.axis = .horizontal,
+        .vertical => slide.axis = .vertical,
+        .none => slide.axis = .none,
+    }
+    if (cfg.workspace_duration > 0) slide.duration = cfg.workspace_duration;
+    if (cfg.workspace_spring) |sp| slide.ease = .{ .spring = sp };
+}
+
+/// Apply a slide offset to a rect position in GL space. Offsets are in
+/// layout space (y down); the GL y-axis points up, so vertical offsets
+/// flip sign.
+fn applyOffset(x: *f32, y: *f32, off: workspace_slide.Offsets, amount: f32) void {
+    switch (off.axis) {
+        .horizontal => x.* += amount,
+        .vertical => y.* -= amount,
+        .none => {},
     }
 }
 
@@ -681,6 +814,9 @@ fn loadConfig(allocator: std.mem.Allocator, cli: *const CliArgs) !config_mod.Con
                 .transition_duration = 0.3,
                 .cursor_smoothing = 0.15,
                 .geometry_smoothing = 0.12,
+                .workspace_slide = .auto,
+                .workspace_duration = 0,
+                .workspace_spring = null,
                 .config_path = try allocator.dupe(u8, ""),
             };
         };

@@ -12,8 +12,9 @@ const log = std.log.scoped(.hypr_events);
 /// `custom>>hg:*` events, so the main thread never polls `.socket.sock`.
 ///
 ///   hg:cur:<x>,<y>   cursor moved — stored in atomics
-///   hg:geo:<records> visible-window snapshot — stored under mutex,
-///                    generation counter bumped
+///   hg:geo:<wsid>\x1d<records>
+///                    workspace id + visible-window snapshot — stored
+///                    under mutex, generation counter bumped
 ///   hg:hb            watcher heartbeat (~2s) — timestamp stored so the
 ///                    main loop can detect a dead watcher and reinstall
 pub const HyprEvents = struct {
@@ -258,7 +259,9 @@ fn handleLine(self: *HyprEvents, line: []const u8) void {
     // Everything else (workspace/window lifecycle, submap, bell, …) is
     // ignored: the Lua watcher's hg:geo events supersede the old
     // dirty-flag machinery — any change that matters shows up as a new
-    // snapshot within one watcher tick.
+    // snapshot within one watcher tick. That includes workspacev2:
+    // workspace identity rides inside hg:geo so it stays atomic with
+    // the window set it describes.
 }
 
 /// Watcher event payloads (the part after `custom>>`).
@@ -292,17 +295,27 @@ fn handleCustom(self: *HyprEvents, data: []const u8) void {
 
 const field_sep = 0x1F; // unit separator, between fields of a record
 const record_sep = 0x1E; // record separator, between windows
+const group_sep = 0x1D; // group separator, between workspace id and records
 
-/// Parse an `hg:geo` payload: records separated by \x1E, fields by \x1F:
+/// Parse an `hg:geo` payload: `<wsid> \x1D <records>`, records separated
+/// by \x1E, fields by \x1F:
 ///   address \x1F x \x1F y \x1F w \x1F h \x1F class \x1F title
-/// An empty payload is a valid zero-window snapshot. Malformed records
-/// are skipped; the watcher strips control characters from class/title
-/// so the separators cannot appear inside fields.
+/// A payload without \x1D (an old in-compositor watcher that predates the
+/// wsid prefix) parses as records only, workspace_id 0. An empty record
+/// section is a valid zero-window snapshot. Malformed records are
+/// skipped; the watcher strips control characters from class/title so
+/// the separators cannot appear inside fields.
 fn parseGeo(payload: []const u8) hypr.VisibleWindows {
     var result = hypr.VisibleWindows{};
-    if (payload.len == 0) return result;
 
-    var records = std.mem.splitScalar(u8, payload, record_sep);
+    var records_payload = payload;
+    if (std.mem.indexOfScalar(u8, payload, group_sep)) |gi| {
+        result.workspace_id = std.fmt.parseInt(i64, payload[0..gi], 10) catch 0;
+        records_payload = payload[gi + 1 ..];
+    }
+    if (records_payload.len == 0) return result;
+
+    var records = std.mem.splitScalar(u8, records_payload, record_sep);
     while (records.next()) |rec| {
         if (result.count >= hypr.max_visible_windows) break;
 
@@ -435,6 +448,36 @@ test "handleLine hg:geo malformed records are skipped" {
     ev.copySnapshot(&snap);
     try std.testing.expectEqual(@as(u8, 1), snap.count);
     try std.testing.expectEqualStrings("ok", snap.windows[0].className());
+}
+
+test "handleLine hg:geo workspace id prefix" {
+    var ev = testEvents();
+    handleLine(&ev, "custom>>hg:geo:5\x1d0x1\x1f0\x1f0\x1f10\x1f10\x1fa\x1fb");
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, 5), snap.workspace_id);
+    try std.testing.expectEqual(@as(u8, 1), snap.count);
+
+    // Special workspaces have negative ids.
+    handleLine(&ev, "custom>>hg:geo:-98\x1d");
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, -98), snap.workspace_id);
+    try std.testing.expectEqual(@as(u8, 0), snap.count);
+
+    // Garbage id degrades to 0 (unknown); records still parse.
+    handleLine(&ev, "custom>>hg:geo:junk\x1d0x2\x1f1\x1f2\x1f3\x1f4\x1fc\x1fd");
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
+    try std.testing.expectEqual(@as(u8, 1), snap.count);
+}
+
+test "handleLine hg:geo old format without wsid still parses" {
+    var ev = testEvents();
+    handleLine(&ev, "custom>>hg:geo:0x1\x1f0\x1f0\x1f10\x1f10\x1fa\x1fb");
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
+    try std.testing.expectEqual(@as(u8, 1), snap.count);
 }
 
 test "handleLine hg:hb stores heartbeat timestamp" {

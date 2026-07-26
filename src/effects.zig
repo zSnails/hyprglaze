@@ -55,6 +55,9 @@ pub const FrameState = struct {
     focused_title: [64]u8 = [_]u8{0} ** 64,
     focused_title_len: u8 = 0,
     palette: ?*const palette_mod.Palette = null,
+    /// Workspace slide settling: 0 = switch just happened, 1 = settled.
+    /// Effects can use it to suppress per-window churn mid-slide.
+    workspace_slide: f32 = 1.0,
 };
 
 /// The active desktop effect. Method contract for every variant Context:

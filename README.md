@@ -77,6 +77,15 @@ theme = "Rosé Pine"
 [transition]
 duration = 0.25
 
+# Workspace switches slide the effect field, mirroring Hyprland's own
+# workspace animation (direction, duration, and easing are detected from
+# `hyprctl animations` at startup and on config reload). Overrides:
+# workspace_slide = "auto"      # auto | horizontal | vertical | none
+# workspace_duration = 0.0      # seconds; 0 = auto (bezier easing only)
+# workspace_spring = ""         # "mass,stiffness,dampening" (Hyprland does
+#                               # not expose spring parameters over IPC, so a
+#                               # custom hl.curve spring must be mirrored here)
+
 [cursor]
 smoothing = 0.85
 
@@ -179,13 +188,11 @@ The daemon holds a single socket2 connection and receives everything as push: cu
 | `iTime` | `float` | Seconds since start |
 | `iMouse` | `vec4` | Cursor position (smoothed) |
 | `iWindow` | `vec4` | Focused window rect (smoothed) |
-| `iPrevWindow` | `vec4` | Previously focused window rect, for outgoing transitions |
-| `iWindows[32]` | `vec4[]` | All visible window rects |
+| `iWindows[32]` | `vec4[]` | All visible window rects (during a workspace switch: incoming and outgoing sets composed, sliding) |
 | `iWindowCount` | `int` | Number of visible windows |
 | `iFocusedIndex` | `int` | Index of the focused window in `iWindows` (-1 if none) |
 | `iPrevIndex` | `int` | Index of the previously focused window in `iWindows` |
 | `iTransition` | `float` | Focus change progress 0 to 1 (newly focused) |
-| `iPrevAlpha` | `float` | Outgoing focus progress 1 to 0 (previously focused) |
 | `iPalette[16]` | `vec3[]` | Theme color ramp |
 | `iPaletteSize` | `int` | Number of palette colors |
 | `iPaletteBg/Fg` | `vec3` | Theme background/foreground |
