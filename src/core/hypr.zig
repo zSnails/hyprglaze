@@ -14,6 +14,10 @@ pub const WindowGeometry = struct {
     w: i32,
     h: i32,
     address: u64 = 0,
+    /// Workspace strip slot: -1 previous, 0 active, +1 next. Neighbor
+    /// windows are parked one screen off-screen along the slide axis so
+    /// the whole strip moves as one piece on a workspace switch.
+    rel: i8 = 0,
     class: [128]u8 = undefined,
     class_len: u8 = 0,
     title: [128]u8 = undefined,

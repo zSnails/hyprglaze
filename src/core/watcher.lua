@@ -5,11 +5,18 @@
 -- Pushes compact events onto socket2 (`custom>>hg:...`) so the daemon
 -- never has to poll `.socket.sock`:
 --   hg:cur:<x>,<y>              cursor moved (floored layout coords)
---   hg:geo:<wsid>\29<records>   active workspace id + visible windows,
---                               emitted when either changed; records
---                               joined by \30, fields by \31:
---                               addr \31 x \31 y \31 w \31 h \31 class \31 title
---                               wsid rides with the geometry so workspace
+--   hg:geo:<wsid>\29<records>   active workspace id + the window strip:
+--                               active workspace windows plus those on
+--                               its nearest existing neighbor workspaces
+--                               (same monitor), emitted when anything
+--                               changed; records joined by \30, fields
+--                               by \31:
+--                               addr \31 x \31 y \31 w \31 h \31 class
+--                               \31 title \31 rel
+--                               rel is -1 (previous), 0 (active) or 1
+--                               (next); active records come first so the
+--                               daemon's 32-window cap favors them. wsid
+--                               rides with the geometry so workspace
 --                               identity and window set stay atomic
 --   hg:hb                       heartbeat, every 128 ticks (~2s)
 --
@@ -39,23 +46,58 @@ __hyprglaze.t = hl.timer(function()
     end
 
     local ws = hl.get_active_workspace()
-    -- ws.id may be a Lua float (like w.at/w.size); %.0f avoids "4.0".
-    local wsid = string.format("%.0f", (type(ws) == "number" and ws) or (ws and ws.id) or 0)
+    local wsid_n = (type(ws) == "number" and ws) or (ws and ws.id) or 0
 
-    local parts = {}
-    for _, w in ipairs(hl.get_windows({ workspace = ws, mapped = true })) do
+    -- Nearest existing neighbor workspaces on the same monitor (ids have
+    -- gaps, so "adjacent" is the closest id, not id±1). Specials
+    -- (negative ids) never join the strip.
+    local rel_of = {}
+    if wsid_n > 0 then
+        rel_of[wsid_n] = 0
+        local ws_mon = type(ws) ~= "number" and ws and ws.monitor or nil
+        local prev_id, next_id = nil, nil
+        for _, other in ipairs(hl.get_workspaces()) do
+            local oid = other.id
+            if oid > 0 and oid ~= wsid_n and (not ws_mon or other.monitor == ws_mon) then
+                if oid < wsid_n and (not prev_id or oid > prev_id) then prev_id = oid end
+                if oid > wsid_n and (not next_id or oid < next_id) then next_id = oid end
+            end
+        end
+        if prev_id then rel_of[prev_id] = -1 end
+        if next_id then rel_of[next_id] = 1 end
+    end
+
+    local buckets = { [-1] = {}, [0] = {}, [1] = {} }
+    for _, w in ipairs(hl.get_windows({ mapped = true })) do
         if w.visible then
-            parts[#parts + 1] = table.concat({
-                w.address,
-                string.format("%.0f", w.at.x),
-                string.format("%.0f", w.at.y),
-                string.format("%.0f", w.size.x),
-                string.format("%.0f", w.size.y),
-                clean(w.class),
-                clean(w.title),
-            }, FS)
+            local wid = (type(w.workspace) == "number" and w.workspace)
+                or (w.workspace and w.workspace.id)
+            local rel = wid and rel_of[wid]
+            -- Unknown active id: degrade to the old active-only filter.
+            if not rel and wsid_n <= 0 and w.workspace == ws then rel = 0 end
+            if rel then
+                local b = buckets[rel]
+                b[#b + 1] = table.concat({
+                    w.address,
+                    string.format("%.0f", w.at.x),
+                    string.format("%.0f", w.at.y),
+                    string.format("%.0f", w.size.x),
+                    string.format("%.0f", w.size.y),
+                    clean(w.class),
+                    clean(w.title),
+                    tostring(rel),
+                }, FS)
+            end
         end
     end
+    local parts = {}
+    for _, rel in ipairs({ 0, -1, 1 }) do
+        for _, rec in ipairs(buckets[rel]) do
+            parts[#parts + 1] = rec
+        end
+    end
+    -- wsid may be a Lua float (like w.at/w.size); %.0f avoids "4.0".
+    local wsid = string.format("%.0f", wsid_n)
     -- Compare wsid + records together: a switch between two identically
     -- laid out (e.g. both empty) workspaces must still emit.
     local geo = wsid .. GS .. table.concat(parts, RS)

@@ -299,12 +299,13 @@ const group_sep = 0x1D; // group separator, between workspace id and records
 
 /// Parse an `hg:geo` payload: `<wsid> \x1D <records>`, records separated
 /// by \x1E, fields by \x1F:
-///   address \x1F x \x1F y \x1F w \x1F h \x1F class \x1F title
-/// A payload without \x1D (an old in-compositor watcher that predates the
-/// wsid prefix) parses as records only, workspace_id 0. An empty record
-/// section is a valid zero-window snapshot. Malformed records are
-/// skipped; the watcher strips control characters from class/title so
-/// the separators cannot appear inside fields.
+///   address \x1F x \x1F y \x1F w \x1F h \x1F class \x1F title \x1F rel
+/// `rel` is the workspace-strip slot (-1/0/+1); a record without it (an
+/// old in-compositor watcher) defaults to 0, and a payload without \x1D
+/// parses as records only, workspace_id 0. An empty record section is a
+/// valid zero-window snapshot. Malformed records are skipped; the
+/// watcher strips control characters from class/title so the separators
+/// cannot appear inside fields.
 fn parseGeo(payload: []const u8) hypr.VisibleWindows {
     var result = hypr.VisibleWindows{};
 
@@ -343,6 +344,11 @@ fn parseGeo(payload: []const u8) hypr.VisibleWindows {
         const tlen: u8 = @intCast(@min(title_s.len, win.title.len));
         @memcpy(win.title[0..tlen], title_s[0..tlen]);
         win.title_len = tlen;
+
+        if (fields.next()) |rel_s| {
+            const rel = std.fmt.parseInt(i8, rel_s, 10) catch 0;
+            win.rel = std.math.clamp(rel, -1, 1);
+        }
 
         result.windows[result.count] = win;
         result.count += 1;
@@ -469,6 +475,26 @@ test "handleLine hg:geo workspace id prefix" {
     ev.copySnapshot(&snap);
     try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
     try std.testing.expectEqual(@as(u8, 1), snap.count);
+}
+
+test "handleLine hg:geo strip rel field" {
+    var ev = testEvents();
+    handleLine(&ev, "custom>>hg:geo:4\x1d" ++
+        "0x1\x1f0\x1f0\x1f10\x1f10\x1fa\x1ft\x1f0" ++ "\x1e" ++
+        "0x2\x1f5\x1f5\x1f10\x1f10\x1fb\x1ft\x1f-1" ++ "\x1e" ++
+        "0x3\x1f9\x1f9\x1f10\x1f10\x1fc\x1ft\x1f1" ++ "\x1e" ++
+        "0x4\x1f9\x1f9\x1f10\x1f10\x1fd\x1ft\x1f7"); // out-of-range clamps
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(u8, 4), snap.count);
+    try std.testing.expectEqual(@as(i8, 0), snap.windows[0].rel);
+    try std.testing.expectEqual(@as(i8, -1), snap.windows[1].rel);
+    try std.testing.expectEqual(@as(i8, 1), snap.windows[2].rel);
+    try std.testing.expectEqual(@as(i8, 1), snap.windows[3].rel);
+    // A record without the rel field (old watcher) defaults to 0.
+    handleLine(&ev, "custom>>hg:geo:4\x1d0x9\x1f1\x1f1\x1f5\x1f5\x1fk\x1ft");
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i8, 0), snap.windows[0].rel);
 }
 
 test "handleLine hg:geo old format without wsid still parses" {

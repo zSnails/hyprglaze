@@ -188,7 +188,7 @@ The daemon holds a single socket2 connection and receives everything as push: cu
 | `iTime` | `float` | Seconds since start |
 | `iMouse` | `vec4` | Cursor position (smoothed) |
 | `iWindow` | `vec4` | Focused window rect (smoothed) |
-| `iWindows[32]` | `vec4[]` | All visible window rects (during a workspace switch: incoming and outgoing sets composed, sliding) |
+| `iWindows[32]` | `vec4[]` | The window strip: active workspace rects plus adjacent-workspace rects parked one screen off-screen, all live; the whole strip slides on a workspace switch |
 | `iWindowCount` | `int` | Number of visible windows |
 | `iFocusedIndex` | `int` | Index of the focused window in `iWindows` (-1 if none) |
 | `iPrevIndex` | `int` | Index of the previously focused window in `iWindows` |

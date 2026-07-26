@@ -1,10 +1,11 @@
 //! Workspace-switch slide transition: clock, direction, and easing.
 //!
-//! When the active workspace changes, the daemon slides the outgoing
-//! window set off-screen while the incoming set slides in, mirroring
-//! Hyprland's own workspace animation. This module owns the state
-//! machine and the easing math; the window-rect storage and the actual
-//! offset application live in main.zig.
+//! The daemon tracks a live strip of windows: the active workspace plus
+//! its neighbors parked one screen off-screen (WindowGeometry.rel). On a
+//! switch, every strip position jumps by one span as rel values rebase
+//! around the new active workspace; this module supplies the camera
+//! offset that cancels that jump and eases back to zero, mirroring
+//! Hyprland's own workspace animation. main.zig applies the offset.
 //!
 //! Easing reproduces Hyprland's animation engine (hyprutils):
 //! - Cubic beziers are evaluated CSS-style over `duration` seconds
@@ -36,16 +37,6 @@ pub const Ease = union(enum) {
 
 pub const Change = enum { none, snap, slide };
 
-/// Offsets in layout space (positive x = right, positive y = down —
-/// matching Hyprland's coordinate system, NOT the GL y-up space).
-/// For `.horizontal` add to rect x; for `.vertical` the caller must
-/// negate before adding to GL-space y (deriveRawState flips y).
-pub const Offsets = struct {
-    incoming: f32,
-    outgoing: f32,
-    axis: Axis,
-};
-
 pub const WorkspaceSlide = struct {
     axis: Axis = .horizontal,
     ease: Ease = .{ .spring = .{} },
@@ -67,8 +58,8 @@ pub const WorkspaceSlide = struct {
     }
 
     /// Feed the workspace id carried by each geometry snapshot. Returns
-    /// what the caller should do: nothing, snap the window set, or
-    /// capture the outgoing set and let `sample` drive a slide.
+    /// what the caller should do: nothing, snap the window set, or let
+    /// `sample` drive the camera through a slide.
     pub fn noteWorkspace(self: *WorkspaceSlide, ws_id: i64, time: f64) Change {
         if (ws_id == self.last_ws_id) return .none;
 
@@ -84,19 +75,22 @@ pub const WorkspaceSlide = struct {
             return .snap;
         }
 
-        // Mid-slide retargets restart the clock; the caller re-captures
-        // the currently displayed (composed) set as the new outgoing
-        // set, so the switch stays visually continuous.
+        // Mid-slide retargets restart the clock; strip positions rebase
+        // around the new workspace and the camera re-cancels the jump,
+        // so the switch stays visually continuous.
         self.dir = if (ws_id > prev) 1.0 else -1.0;
         self.start = time;
         self.active = true;
         return .slide;
     }
 
-    /// Current offsets, or null when no slide is running. Deactivates
-    /// itself once the easing settles. `span` is the screen extent along
-    /// the slide axis (width for horizontal, height for vertical).
-    pub fn sample(self: *WorkspaceSlide, time: f64, span: f32) ?Offsets {
+    /// Current camera offset in layout space (positive x = right,
+    /// positive y = down; the caller flips sign for the GL y-up axis),
+    /// or null when no slide is running. Applied uniformly to every
+    /// strip window; starts at ±span (cancelling the rel rebase) and
+    /// eases to zero. Deactivates itself once the easing settles. `span`
+    /// is the screen extent along the slide axis.
+    pub fn sample(self: *WorkspaceSlide, time: f64, span: f32) ?f32 {
         if (!self.active) return null;
         const t: f32 = @floatCast(@max(time - self.start, 0));
 
@@ -121,13 +115,9 @@ pub const WorkspaceSlide = struct {
             },
         };
 
-        // A spring's e may overshoot past 1, pushing rects slightly
-        // beyond their rest position and back — the springy feel.
-        return .{
-            .incoming = self.dir * (1.0 - e) * span,
-            .outgoing = -self.dir * e * span,
-            .axis = self.axis,
-        };
+        // A spring's e may overshoot past 1, pushing the strip slightly
+        // beyond its rest position and back — the springy feel.
+        return self.dir * (1.0 - e) * span;
     }
 
     /// 0 → 1 settling indicator for effects; 1.0 whenever idle.
@@ -239,16 +229,13 @@ test "noteWorkspace direction follows id ordering" {
     ws.seed(1);
     try std.testing.expectEqual(Change.slide, ws.noteWorkspace(2, 1.0));
     try std.testing.expectEqual(@as(f32, 1.0), ws.dir);
-    // Right after the start, the incoming set sits nearly a full span
-    // toward the direction it enters from.
-    const off = ws.sample(1.0, 1000.0).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 1000.0), off.incoming, 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), off.outgoing, 0.001);
+    // At the start the camera cancels the full rebase jump: strip
+    // positions moved -span, the camera holds them at +span.
+    try std.testing.expectApproxEqAbs(@as(f32, 1000.0), ws.sample(1.0, 1000.0).?, 0.001);
 
     try std.testing.expectEqual(Change.slide, ws.noteWorkspace(1, 2.0));
     try std.testing.expectEqual(@as(f32, -1.0), ws.dir);
-    const back = ws.sample(2.0, 1000.0).?;
-    try std.testing.expectApproxEqAbs(@as(f32, -1000.0), back.incoming, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1000.0), ws.sample(2.0, 1000.0).?, 0.001);
 }
 
 test "noteWorkspace unknown or special ids snap" {
@@ -276,7 +263,7 @@ test "noteWorkspace disabled axis or degenerate duration snaps" {
     ws2.duration = 0;
     ws2.seed(1);
     try std.testing.expectEqual(Change.snap, ws2.noteWorkspace(2, 1.0));
-    try std.testing.expectEqual(@as(?Offsets, null), ws2.sample(1.0, 100.0));
+    try std.testing.expectEqual(@as(?f32, null), ws2.sample(1.0, 100.0));
 }
 
 test "sample eases across the span and deactivates at the end" {
@@ -284,11 +271,9 @@ test "sample eases across the span and deactivates at the end" {
     ws.seed(1);
     _ = ws.noteWorkspace(2, 10.0);
 
-    const mid = ws.sample(10.5, 1000.0).?;
-    try std.testing.expectApproxEqAbs(@as(f32, 500.0), mid.incoming, 1.0);
-    try std.testing.expectApproxEqAbs(@as(f32, -500.0), mid.outgoing, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 500.0), ws.sample(10.5, 1000.0).?, 1.0);
 
-    try std.testing.expectEqual(@as(?Offsets, null), ws.sample(11.5, 1000.0));
+    try std.testing.expectEqual(@as(?f32, null), ws.sample(11.5, 1000.0));
     try std.testing.expect(!ws.active);
     // Idle progress reads settled.
     try std.testing.expectEqual(@as(f32, 1.0), ws.progress(12.0));
@@ -302,8 +287,7 @@ test "retarget mid-slide restarts the clock and recomputes direction" {
     try std.testing.expectEqual(Change.slide, ws.noteWorkspace(1, 10.4));
     try std.testing.expectEqual(@as(f32, -1.0), ws.dir);
     try std.testing.expectEqual(@as(f64, 10.4), ws.start);
-    const off = ws.sample(10.4, 1000.0).?;
-    try std.testing.expectApproxEqAbs(@as(f32, -1000.0), off.incoming, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, -1000.0), ws.sample(10.4, 1000.0).?, 0.001);
 }
 
 test "spring settles and deactivates" {
@@ -311,10 +295,9 @@ test "spring settles and deactivates" {
     ws.seed(1);
     _ = ws.noteWorkspace(2, 0.0);
     // Just after the start: nearly full offset, definitely active.
-    const early = ws.sample(0.01, 1000.0).?;
-    try std.testing.expect(early.incoming > 900.0);
+    try std.testing.expect(ws.sample(0.01, 1000.0).? > 900.0);
     // The default spring (k=250, c=25, m=1) settles well within 2s.
-    try std.testing.expectEqual(@as(?Offsets, null), ws.sample(2.0, 1000.0));
+    try std.testing.expectEqual(@as(?f32, null), ws.sample(2.0, 1000.0));
     try std.testing.expect(!ws.active);
 }
 
@@ -325,12 +308,11 @@ test "underdamped spring overshoots its rest position" {
     const wd = @sqrt(100.0 - 2.5 * 2.5);
     const peak = springEval(sp, std.math.pi / wd);
     try std.testing.expect(peak.value > 1.05);
-    // An overshooting ease flips the incoming offset past zero.
+    // An overshooting ease pushes the camera past its rest position.
     var ws = WorkspaceSlide{ .ease = .{ .spring = sp } };
     ws.seed(1);
     _ = ws.noteWorkspace(2, 0.0);
-    const off = ws.sample(std.math.pi / wd, 1000.0).?;
-    try std.testing.expect(off.incoming < 0.0);
+    try std.testing.expect(ws.sample(std.math.pi / wd, 1000.0).? < 0.0);
 }
 
 test "spring branches are finite and settle toward 1" {
