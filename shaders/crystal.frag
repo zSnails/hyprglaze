@@ -165,7 +165,7 @@ bool traceShard(vec3 ro, vec3 rd, int nplanes, uint seed, vec3 scale,
 // surroundings bent through it, so this field is doing as much work as
 // the geometry: a graded sky, the ground below, and one hard light whose
 // reflection is what makes faces flash.
-vec3 environ(vec3 d, vec3 L, vec3 deep, vec3 mid, vec3 pale, float beat) {
+vec3 environ(vec3 d, vec3 L, vec3 deep, vec3 mid, vec3 pale, vec3 warm, float beat) {
     // A graded surround with real range in it: every face is showing this
     // field from a different angle, so if it is flat the faces come out
     // flat too, however good the geometry is.
@@ -179,7 +179,16 @@ vec3 environ(vec3 d, vec3 L, vec3 deep, vec3 mid, vec3 pale, float beat) {
     float k = max(dot(d, L), 0.0);
     col += pale * pow(k, 24.0) * (1.6 + beat * 1.2);
     col += mid * pow(k, 3.0) * 0.55;
-    col += mix(mid, pale, 0.3) * pow(max(dot(d, -L), 0.0), 6.0) * 0.22;
+    // A warm counter-light from the far side, in a second colour out of
+    // the theme. One hue family gives the stone nothing for its
+    // dispersion to separate — with a second light opposite the key,
+    // faces turned away pick up a different colour entirely, and the
+    // refraction has two ends of a spectrum to split between.
+    // Tight, so it reads as a second light rather than as a wash over
+    // everything — the accent has to stay the stone's colour.
+    float cl = max(dot(d, -L), 0.0);
+    col += mix(warm, pale, 0.25) * pow(cl, 6.0) * 0.62;
+    col += warm * pow(cl, 3.0) * 0.10;
     return col;
 }
 
@@ -194,11 +203,25 @@ void main() {
     vec3 accent = (iPaletteSize > 5) ? iPalette[5] : vec3(0.77, 0.65, 0.91);
     vec3 c_sec = (iPaletteSize > 6) ? iPalette[6] : vec3(0.61, 0.81, 0.85);
 
+    // The theme's warm entry, standing opposite the accent. This is the
+    // second colour in the stone: it lights the far side of every face,
+    // and it gives the dispersion two ends to split between — one hue
+    // family alone leaves the refraction nothing to separate.
+    vec3 c_warm = (iPaletteSize > 3) ? iPalette[3] : vec3(0.96, 0.76, 0.46);
+
     // One hue family across a wide value range, built around the theme's
     // accent so the stone takes on whatever palette is loaded.
     vec3 deep = mix(bg, accent, 0.16);
     vec3 mid = mix(accent, c_sec, 0.20) * 0.72;
     vec3 pale = mix(accent, fg, 0.70);
+    vec3 warm = mix(c_warm, fg, 0.10);
+    // Spectral ends for the refraction: departures from the body tone
+    // rather than replacements for it. Tinting a full third of the
+    // transmission outright averages the three into a neutral wash and
+    // the accent stops being the stone's colour at all.
+    vec3 tint_base = mix(mid, pale, 0.35);
+    vec3 tint_lo = mix(tint_base, c_warm, 0.55);
+    vec3 tint_hi = mix(tint_base, c_sec, 0.45);
 
     float turn = iCrysTurn;
     float disp = 0.030 * iCrysDisp * (1.0 + min(iCrysBass, 1.2) * 0.6);
@@ -313,17 +336,23 @@ void main() {
         // different bends, which is dispersion doing what it actually does
         // — splitting the transmitted image, not just the highlights.
         vec3 rfl = reflect(rd, n);
-        vec3 col = environ(rfl, L, deep, mid, pale, iCrysBeat) * 0.55;
+        vec3 col = environ(rfl, L, deep, mid, pale, warm, iCrysBeat) * 0.55;
 
         vec3 tr = refract(rd, n, 0.72);
         if (dot(tr, tr) < 1e-6) tr = rfl;
-        vec3 trans;
-        trans.r = environ(normalize(tr + n * disp), L, deep, mid, pale, iCrysBeat).r;
-        trans.g = environ(tr, L, deep, mid, pale, iCrysBeat).g;
-        trans.b = environ(normalize(tr - n * disp), L, deep, mid, pale, iCrysBeat).b;
+        // The three bends stand in for the spectrum, and each is tinted
+        // with a different colour from the theme — the least-bent light
+        // carries the warm hue, the most-bent the cool one. Where the
+        // surround is even the three cancel back to the body colour;
+        // where it changes fast, at edges and grazing faces, they part
+        // and the split shows as real colour rather than as a fringe.
+        vec3 eLo = environ(normalize(tr + n * disp), L, deep, mid, pale, warm, iCrysBeat);
+        vec3 eMid = environ(tr, L, deep, mid, pale, warm, iCrysBeat);
+        vec3 eHi = environ(normalize(tr - n * disp), L, deep, mid, pale, warm, iCrysBeat);
+        vec3 trans = (eLo * tint_lo + eMid * tint_base + eHi * tint_hi) * 0.62;
         // Thicker stone absorbs more and saturates what survives.
         trans *= exp(-thick * 0.42);
-        col += trans * mix(mid, pale, 0.35) * 1.25;
+        col += trans * 1.25;
 
         // Internal veins: healed fractures and phantom growth planes.
         // Found along the ray rather than sampled at one depth — a plane
