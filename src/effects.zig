@@ -28,6 +28,7 @@ const fable = @import("effects/fable.zig");
 const ivy = @import("effects/ivy.zig");
 const whorl = @import("effects/whorl.zig");
 const weft = @import("effects/weft.zig");
+const crystal = @import("effects/crystal.zig");
 
 /// Class and title of one mapped window (truncated copies), parallel to
 /// `FrameState.windows` by index.
@@ -93,6 +94,7 @@ pub const Effect = union(enum) {
     ivy: ivy.Context,
     whorl: whorl.Context,
     weft: weft.Context,
+    crystal: crystal.Context,
 
     /// Config section an effect reads its params from. Defaults to the
     /// variant name; the exceptions: starfield and milkdrop intentionally

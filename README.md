@@ -42,6 +42,7 @@ A wallpaper daemon for Hyprland that renders GLSL shaders and modular effects on
 | `ivy` | Bioluminescent vines climb window frames and screen edges, spread frame to frame, wilt in place when windows move |
 | `weft` | Windows shine through a grainy diffraction weave; the audio waveform threads through the fringes |
 | `whorl` | Cyclic cellular automaton on a phosphor CRT: two-tone spiral waves break around windows, music wired into the rules |
+| `crystal` | A ray-traced cluster of quartz shards with real refraction and dispersion; your windows are the lights, and the focused one is the key light |
 
 ## Requirements
 
@@ -70,9 +71,13 @@ zig build run
 ```toml
 # Effects: particles, windowglow, cellbloom, concentric, fluid, starfield,
 #          visualizer, milkdrop, glitch, buddy, ai-buddy, tide, fire, swarm,
-#          voltaic, moire, fable, ivy, whorl, weft
+#          voltaic, moire, fable, ivy, whorl, weft, crystal
 effect = "fluid"
 theme = "Rosé Pine"
+
+[crystal]
+# dispersion = 1.0    # prismatic colour split through the shards
+# brightness = 1.0    # overall level
 
 [transition]
 duration = 0.25
