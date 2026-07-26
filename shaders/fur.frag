@@ -103,15 +103,15 @@ void combAt(vec2 p, vec2 res, float t, float bass,
         // own instead of being cut off at a fixed radius: a hard stop at
         // either end draws a second rim.
         vec2 away = p - c;
-        float ridge = smoothstep(0.0, 34.0, d) * exp(-max(d, 0.0) / 105.0);
-        lie += (away / max(length(away), 1.0)) * ridge * 1.15;
+        float ridge = smoothstep(0.0, 46.0, d) * exp(-max(d, 0.0) / 130.0);
+        lie += (away / max(length(away), 1.0)) * ridge * 0.42;
         float fa = 0.0;
         if (i == iFocusedIndex) fa = smoothstep(0.0, 1.0, iTransition);
         if (i == iPrevIndex) fa = max(fa, 1.0 - smoothstep(0.0, 1.0, iTransition));
         // The focused window's edge keeps its pile standing and stirred.
         // Spread wide so it reads as a glow in the coat rather than as
         // another ring following the frame.
-        ruffle = max(ruffle, fa * exp(-max(d, 0.0) / 150.0) * 0.8);
+        ruffle = max(ruffle, fa * exp(-max(d, 0.0) / 180.0) * 0.42);
     }
     flat_amt = clamp(flat_amt, 0.0, 1.0);
     // Cap how far the pile can be pushed over. Where several influences
@@ -156,9 +156,9 @@ void main() {
     combAt(fc, res, t, bass, lie, flat_amt, ruffle);
     // A crushed patch keeps almost none of its height, and a ruffled edge
     // stands taller than the rest of the coat.
-    float pile_h = pile * (1.0 - flat_amt * 0.82) * (1.0 + ruffle * 0.35);
+    float pile_h = pile * (1.0 - flat_amt * 0.82) * (1.0 + ruffle * 0.18);
     // Pressed pile also lies over rather than standing up.
-    vec2 lean = lie * (1.0 + flat_amt * 2.2);
+    vec2 lean = lie * (1.0 + flat_amt * 1.2);
 
     // Parallax: the view leans further from straight-on toward the edges
     // of the screen, so the pile there is seen from the side and the
