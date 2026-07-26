@@ -26,7 +26,14 @@ const max_leaves = 200;
 const leaf_spacing: f32 = 26.0;
 const max_fall = 40;
 
-const vine_die_secs: f32 = 1.2;
+// Dieback timing: a necrosis front sweeps from the tip toward the root
+// over die_front_secs — the stem's glow drains and leaves let go as it
+// passes — then the last residual glow fades by vine_die_secs. Stems
+// hold their shape throughout; only the leaves move.
+const vine_die_secs: f32 = 1.3;
+const die_front_secs: f32 = 0.9;
+/// Half-width of the necrosis front's soft edge, in arc length.
+const front_soft: f32 = 30.0;
 
 const Vine = struct {
     active: bool = false,
@@ -81,6 +88,22 @@ fn fhash(a: f32, b: f32) f32 {
 }
 
 const smoothstep = bands_mod.smoothstep;
+
+/// Arc position of the necrosis front for a vine `d` seconds into
+/// dieback: starts at the tip (dl) and sweeps to the root (0), eased so
+/// it lingers at both ends.
+fn wiltFront(dl: f32, d: f32) f32 {
+    return dl * (1.0 - smoothstep(0.0, die_front_secs, d));
+}
+
+/// How dead the vine is locally at arc offset `s` (0 alive, 1 past the
+/// front), for a vine `d` seconds into dieback.
+fn localWilt(v: *const Vine, s: f32, d: f32) f32 {
+    if (d <= 0) return 0;
+    const front = wiltFront(v.dl, d);
+    return smoothstep(front - front_soft, front + front_soft, s);
+}
+
 
 /// Point on a rect's border at perimeter offset `t` (wraps), walking
 /// bottom -> right -> top -> left (voltaic pattern), plus the outward
@@ -232,16 +255,15 @@ pub const Context = struct {
     }
 
     /// Wilt every live vine on `addr` in place: freeze its anchor at
-    /// `rect` — where the plant stood — and start the dieback fade.
+    /// `rect` — where the plant stood — and start the dieback. Leaves
+    /// are not shed here: they let go one by one as the necrosis front
+    /// passes their node.
     fn wiltVines(self: *Context, addr: u64, rect: shader_mod.ShaderProgram.WindowRect) void {
         for (&self.vines) |*v| {
             if (!v.active or v.dying > 0 or v.addr != addr) continue;
             v.frozen = true;
             v.frozen_rect = rect;
             v.dying = 0.0001;
-            if (v.parent < 0 and v.dl > 30.0) {
-                self.shedLeaves(self.vinePoint(rect, v, v.dl * 0.6), 2);
-            }
         }
     }
 
@@ -267,11 +289,7 @@ pub const Context = struct {
                 @sin(s * 0.021 + v.seed * 3.1) * 3.5) * amp_v +
             @sin(self.now * 1.2 + s * 0.05 + v.seed) * sway_amp;
         const l = if (v.inward) -@max(lift, 1.5) else @max(lift, 1.5);
-        // Wilt: dying vines droop earthward, tips first (quadratic
-        // ease-in so early death barely sags, then lets go).
-        const wilt = @min(v.dying / vine_die_secs, 1.0);
-        const sag = wilt * wilt * (8.0 + s * 0.35);
-        return .{ hit.pos[0] + hit.normal[0] * l, hit.pos[1] + hit.normal[1] * l - sag };
+        return .{ hit.pos[0] + hit.normal[0] * l, hit.pos[1] + hit.normal[1] * l };
     }
 
     /// A vine node at arc offset `s`. Trunks follow their rect's perimeter;
@@ -306,10 +324,7 @@ pub const Context = struct {
             @sin(s * 0.013 + v.seed * 1.3) * 16.0 * (s / @max(v.target, 1.0)) +
             bend * s * s +
             @sin(self.now * 1.4 + s * 0.06 + v.seed) * sway_amp;
-        // Branch wilt compounds with the parent's sag — tips droop most.
-        const wilt = @min(v.dying / vine_die_secs, 1.0);
-        const sag = wilt * wilt * (6.0 + s * 0.3);
-        return .{ attach[0] + ux * s + px * off, attach[1] + uy * s + py * off - sag };
+        return .{ attach[0] + ux * s + px * off, attach[1] + uy * s + py * off };
     }
 
     fn spawnBranch(self: *Context, parent_idx: usize) void {
@@ -437,6 +452,25 @@ pub const Context = struct {
                 .size = 5.0 + r.float(f32) * 4.0,
             };
         }
+    }
+
+    /// A leaf released by dieback: it detaches with its rendered pose
+    /// and only a gentle push, so the hand-off from stem to air is
+    /// seamless — then gravity, breeze, and tumble take over.
+    fn dropLeaf(self: *Context, pos: [2]f32, angle: f32, size: f32) void {
+        const r = self.rng.random();
+        const slot = self.next_fall;
+        self.next_fall = (self.next_fall + 1) % max_fall;
+        self.fall[slot] = .{
+            .active = true,
+            .pos = pos,
+            .vel = .{ (r.float(f32) * 2.0 - 1.0) * 18.0, -6.0 - r.float(f32) * 14.0 },
+            .angle = angle,
+            .spin = (r.float(f32) * 2.0 - 1.0) * 2.2,
+            .age = 0,
+            .life = 2.8 + r.float(f32) * 1.8,
+            .size = size,
+        };
     }
 
     pub fn update(self: *Context, state: effects.FrameState) void {
@@ -601,14 +635,11 @@ pub const Context = struct {
             }
             if (orphaned and v.dying == 0) {
                 v.dying = 0.0001;
-                // The trellis fell: freeze in place and scatter leaves.
+                // The trellis fell: freeze in place; the dieback front
+                // sheds the leaves as it sweeps.
                 if (rect_opt) |rect| {
                     v.frozen = true;
                     v.frozen_rect = rect;
-                    if (v.parent < 0) {
-                        self.shedLeaves(self.vinePoint(rect, v, v.dl * 0.5), 2);
-                        self.shedLeaves(self.vinePoint(rect, v, v.dl * 0.9), 2);
-                    }
                 }
             }
             if (v.dying > 0) {
@@ -674,11 +705,16 @@ pub const Context = struct {
             const damp = @exp(-0.8 * dt);
             p.vel[0] *= damp;
             p.vel[1] *= damp;
-            p.vel[1] -= 50.0 * dt; // y-up: leaves fall
+            p.vel[1] -= 42.0 * dt; // y-up: leaves fall
             p.vel[0] += @sin(self.now * 0.9 + p.pos[1] * 0.012) * 45.0 * dt; // breeze
+            // Seesaw: a falling leaf rocks on its air cushion, gliding
+            // sideways and briefly catching lift at each swing.
+            const rock = @sin(self.now * 2.4 + p.spin * 7.0 + p.pos[0] * 0.01);
+            p.vel[0] += rock * 30.0 * dt;
+            p.vel[1] += @abs(rock) * 14.0 * dt;
             p.pos[0] += p.vel[0] * dt;
             p.pos[1] += p.vel[1] * dt;
-            p.angle += p.spin * dt;
+            p.angle += p.spin * dt + rock * 0.8 * dt;
         }
 
         // ---- build frame geometry (stems + leaves) ----
@@ -687,8 +723,10 @@ pub const Context = struct {
         for (&self.vines) |*v| {
             if (!v.active) continue;
             const rect = self.vineRect(v) orelse continue;
-            const fade = 1.0 - v.dying / vine_die_secs;
-            if (fade <= 0) continue;
+            // Dead spans fade out as the front passes; any residual glow
+            // drains at the very end of dieback.
+            const end_fade = 1.0 - smoothstep(vine_die_secs - 0.4, vine_die_secs, v.dying);
+            if (end_fade <= 0) continue;
 
             // Stem segments at fixed arc steps; the growing tip glows.
             var s: f32 = 0;
@@ -701,8 +739,9 @@ pub const Context = struct {
                 // Child stems render dimmer — the shader derives width from
                 // brightness, so shoots also read thinner than their parent.
                 const gen = 1.0 - 0.16 * @as(f32, @floatFromInt(v.depth));
+                const lam = localWilt(v, (s + s1) * 0.5, v.dying);
                 self.segs[self.seg_count] = .{ a[0], a[1], b[0], b[1] };
-                self.seg_b[self.seg_count] = (0.4 + tip * 0.6) * fade * gen;
+                self.seg_b[self.seg_count] = (0.4 + tip * 0.6) * gen * end_fade * (1.0 - lam);
                 self.seg_count += 1;
             }
 
@@ -722,19 +761,39 @@ pub const Context = struct {
                 const pb = self.vinePoint(rect, v, ls_e + 5.0);
                 const tang = std.math.atan2(pb[1] - pa[1], pb[0] - pa[0]);
                 const side: f32 = if (li % 2 == 0) 1.0 else -1.0;
-                const flutter = @sin(self.now * 1.6 + ls_e * 0.3 + v.seed) * (0.08 + (self.an.smooth[4] + self.an.smooth[5]) * 0.5 * 0.12);
-                const angle = tang + side * (0.75 + fhash(v.seed + 3.0, fi) * 0.55) + (jit - 0.5) * 0.5 + flutter;
+                const lam = localWilt(v, ls_e, v.dying);
+                // A dying leaf stops fluttering with the music.
+                const flutter = @sin(self.now * 1.6 + ls_e * 0.3 + v.seed) *
+                    (0.08 + (self.an.smooth[4] + self.an.smooth[5]) * 0.5 * 0.12) * (1.0 - lam);
+                var angle = tang + side * (0.75 + fhash(v.seed + 3.0, fi) * 0.55) + (jit - 0.5) * 0.5 + flutter;
                 const grow_in = smoothstep(0.0, 35.0, v.dl - ls_e);
                 // Real ivy: young leaves near the growing tip stay small,
                 // older nodes carry big mature leaves.
                 const mature = 0.5 + 0.5 * smoothstep(0.0, 140.0, v.dl - ls_e);
                 const vary = 0.75 + fhash(v.seed + 7.0, fi) * 0.5;
                 const band = self.an.smooth[@as(usize, @intFromFloat(ls_e)) % 6];
-                const size = (11.5 + @sin(v.seed * 3.0 + ls_e * 0.7) * 3.5) * vary * mature * grow_in * (1.0 + band * 0.08) * fade;
-                if (size > 0.5) {
-                    self.leaves[self.leaf_count] = .{ p0[0], p0[1], angle, size };
-                    self.leaf_count += 1;
+                var size = (11.5 + @sin(v.seed * 3.0 + ls_e * 0.7) * 3.5) * vary * mature * grow_in * (1.0 + band * 0.08) * end_fade;
+                if (lam > 0) {
+                    // Wilting: the petiole loses grip, so the blade
+                    // droops toward hanging and shrivels a little
+                    // before it lets go.
+                    const dd = @mod(-std.math.pi * 0.5 - angle + std.math.pi, std.math.tau) - std.math.pi;
+                    angle += dd * lam * 0.7;
+                    size *= 1.0 - 0.3 * lam;
                 }
+                if (size <= 0.5) continue;
+                // Each node lets go once, at its own point in the front's
+                // passage — detected as the wilt crossing a per-node
+                // threshold between last frame and this one.
+                const thr = 0.25 + 0.55 * fhash(v.seed * 2.3, fi);
+                if (lam >= thr) {
+                    const d_prev = v.dying - dt;
+                    const lam_prev: f32 = if (d_prev <= 0) 0.0 else localWilt(v, ls_e, d_prev);
+                    if (lam_prev < thr and size > 2.0) self.dropLeaf(p0, angle, size);
+                    continue;
+                }
+                self.leaves[self.leaf_count] = .{ p0[0], p0[1], angle, size };
+                self.leaf_count += 1;
             }
         }
     }
@@ -775,12 +834,13 @@ pub const Context = struct {
         if (self.loc_leafcount >= 0) c.glUniform1i(self.loc_leafcount, @intCast(self.leaf_count));
 
         if (self.loc_fall >= 0) {
-            // (x, y, angle, size) — size folds in a sine envelope so leaves
-            // flutter in and fade out.
+            // (x, y, angle, size) — a fast attack so a leaf released by
+            // dieback appears the instant its stem copy vanishes (no
+            // blink), then a fade over the last third of its fall.
             var pv: [max_fall][4]f32 = [_][4]f32{.{ 0, 0, 0, 0 }} ** max_fall;
             for (self.fall, 0..) |p, i| {
                 if (!p.active) continue;
-                const env = @sin(std.math.pi * p.age / p.life);
+                const env = @min(p.age * 10.0, 1.0) * (1.0 - smoothstep(p.life * 0.65, p.life, p.age));
                 pv[i] = .{ p.pos[0], p.pos[1], @mod(p.angle, std.math.tau), p.size * env };
             }
             c.glUniform4fv(self.loc_fall, max_fall, @ptrCast(&pv[0]));
