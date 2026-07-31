@@ -28,6 +28,7 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 }
 
 const CliArgs = struct {
+    output: ?[]const u8 = null,
     shader_path: ?[]const u8 = null,
     theme_name: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -60,6 +61,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (cli.config_path) |p| allocator.free(p);
         if (cli.effect_name) |e| allocator.free(e);
         if (cli.set_theme) |t| allocator.free(t);
+        if (cli.output) |o| allocator.free(o);
     }
 
     if (cli.list_themes) {
@@ -938,6 +940,7 @@ const usage_text =
     \\
     \\Usage: hyprglaze [options]
     \\
+    \\  --output NAME      Output/monitor name to render to (default: first available)
     \\  --config PATH      TOML config path (default: ~/.config/hypr/hyprglaze.toml)
     \\  --effect NAME      Effect to render (see --list-effects)
     \\  --shader PATH      Fragment shader path (overrides effect default)
@@ -960,6 +963,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
         if (out.shader_path) |p| allocator.free(p);
         if (out.theme_name) |p| allocator.free(p);
         if (out.set_theme) |p| allocator.free(p);
+        if (out.output) |p| allocator.free(p);
     }
 
     // Skip argv[0] (the program path).
@@ -974,7 +978,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
             value = arg[eq + 1 ..];
         }
 
-        const StrField = enum { config, effect, shader, theme, set_theme };
+        const StrField = enum { config, effect, shader, theme, set_theme, output };
         const BoolField = enum { list_themes, list_effects, fps, help };
 
         const str_kind: ?StrField = if (std.mem.eql(u8, key, "--config")) .config
@@ -982,6 +986,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
             else if (std.mem.eql(u8, key, "--shader")) .shader
             else if (std.mem.eql(u8, key, "--theme")) .theme
             else if (std.mem.eql(u8, key, "--set-theme")) .set_theme
+            else if (std.mem.eql(u8, key, "--output")) .output
             else null;
 
         if (str_kind) |sk| {
@@ -1000,6 +1005,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
                 .shader => out.shader_path = dup,
                 .theme => out.theme_name = dup,
                 .set_theme => out.set_theme = dup,
+                .output => out.output = dup,
             }
             continue;
         }
