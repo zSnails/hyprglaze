@@ -3,6 +3,10 @@ const posix = std.posix;
 const libc = @import("io_helper.zig").libc;
 const workspace_slide = @import("workspace_slide.zig");
 
+const c = @cImport({
+    @cInclude("wayland-client.h");
+});
+
 pub const CursorPos = struct {
     x: i32,
     y: i32,
@@ -59,6 +63,8 @@ pub const MonitorInfo = struct {
     width: i32,
     height: i32,
     scale: f32,
+
+    output: ?*c.wl_output = null,
 };
 
 fn parseAddress(val: std.json.Value) u64 {
@@ -201,6 +207,55 @@ pub const HyprIpc = struct {
         return parseWorkspaceAnim(allocator, response);
     }
 
+    /// Returns information for the requested monitor.
+    ///
+    /// If `name` is `null`, the primary monitor is returned. Otherwise, returns
+    /// the monitor whose name matches `name`.
+    pub fn getMonitor(self: *const HyprIpc, allocator: std.mem.Allocator, name: ?[]const u8) !MonitorInfo {
+        // TODO: refactor this to remove the primaryMonitor call, we don't
+        // really need it because we already return the first value in the
+        // parsed array
+        if (name == null) return self.primaryMonitor(allocator);
+        var buf: [8192]u8 = undefined;
+        const response = try self.query("j/monitors", &buf);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+        defer parsed.deinit();
+
+        if (parsed.value != .array or parsed.value.array.items.len == 0)
+            return error.BadMonitorReply;
+
+        const monitor = for (parsed.value.array.items) |value| {
+            if (value != .object) return error.BadMonitorReply;
+            const mon = value.object;
+            const mon_name = mon.get("name") orelse return error.BadMonitorReply;
+            const str_test = std.mem.eql(u8, mon_name.string, name.?);
+            if (str_test) break mon;
+        } else parsed.value.array.items[0].object;
+
+        return getMonitorData(monitor);
+    }
+
+    fn getMonitorData(mon: std.json.ObjectMap) !MonitorInfo {
+        const scale_val = mon.get("scale");
+        const scale: f32 = if (scale_val) |sv| switch (sv) {
+            .float => @floatCast(sv.float),
+            .integer => @floatFromInt(sv.integer),
+            else => 1.0,
+        } else 1.0;
+
+        const name = mon.get("name") orelse return error.BadMonitorReply;
+
+        return .{
+            .name = name.string,
+            .x = jsonInt(mon.get("x")) orelse return error.BadMonitorReply,
+            .y = jsonInt(mon.get("y")) orelse return error.BadMonitorReply,
+            .width = jsonInt(mon.get("width")) orelse return error.BadMonitorReply,
+            .height = jsonInt(mon.get("height")) orelse return error.BadMonitorReply,
+            .scale = scale,
+        };
+    }
+
     pub fn primaryMonitor(self: *const HyprIpc, allocator: std.mem.Allocator) !MonitorInfo {
         var buf: [8192]u8 = undefined;
         const response = try self.query("j/monitors", &buf);
@@ -216,20 +271,7 @@ pub const HyprIpc = struct {
         if (first != .object) return error.BadMonitorReply;
         const mon = first.object;
 
-        const scale_val = mon.get("scale");
-        const scale: f32 = if (scale_val) |sv| switch (sv) {
-            .float => @floatCast(sv.float),
-            .integer => @floatFromInt(sv.integer),
-            else => 1.0,
-        } else 1.0;
-
-        return .{
-            .x = jsonInt(mon.get("x")) orelse return error.BadMonitorReply,
-            .y = jsonInt(mon.get("y")) orelse return error.BadMonitorReply,
-            .width = jsonInt(mon.get("width")) orelse return error.BadMonitorReply,
-            .height = jsonInt(mon.get("height")) orelse return error.BadMonitorReply,
-            .scale = scale,
-        };
+        return getMonitorData(mon);
     }
 };
 
