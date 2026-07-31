@@ -53,6 +53,7 @@ pub const WorkspaceAnim = struct {
 };
 
 pub const MonitorInfo = struct {
+    name: []const u8,
     x: i32,
     y: i32,
     width: i32,
