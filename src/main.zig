@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Wayland. Two-phase init: `wl`'s address becomes listener userdata,
     // so it must live here, not in a temporary inside init().
     var wl: wayland.WaylandState = undefined;
-    wl.init() catch |err| {
+    wl.init(allocator, cli.output) catch |err| {
         log.err("Wayland init failed: {}", .{err});
         return err;
     };
