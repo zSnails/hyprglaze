@@ -163,10 +163,55 @@ fn registryGlobal(
         state.compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 4)));
     } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
         state.layer_shell = @ptrCast(c.wl_registry_bind(registry, name, &c.zwlr_layer_shell_v1_interface, @min(version, 1)));
+    } else if (std.mem.eql(u8, iface, "wl_output")) {
+        // NOTE: I'm not storing this output, this output is the
+        const output: *c.wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, @min(version, 4)));
+        if (c.wl_output_add_listener(output, &output_listener, data) != 0) {
+            log.err("something went wrong when registering the output listener, a default output will be used if available", .{});
+        }
     }
 }
 
 fn registryGlobalRemove(_: ?*anyopaque, _: ?*c.wl_registry, _: u32) callconv(.c) void {}
+
+// --- Output listener --
+
+var temp_monitor: hypr.MonitorInfo = undefined;
+
+fn outputHandleGeometry(_: ?*anyopaque, _: ?*c.wl_output, x: i32, y: i32, _: i32, _: i32, _: i32, _: [*c]const u8, _: [*c]const u8, _: i32) callconv(.c) void {
+    temp_monitor.x = x;
+    temp_monitor.y = y;
+}
+
+fn outputHandleMode(_: ?*anyopaque, _: ?*c.wl_output, _: u32, width: i32, height: i32, _: i32) callconv(.c) void {
+    temp_monitor.width = width;
+    temp_monitor.height = height;
+}
+
+fn outputHandleDone(data: ?*anyopaque, output: ?*c.wl_output) callconv(.c) void {
+    const state: *WaylandState = @ptrCast(@alignCast(data));
+    temp_monitor.output = @ptrCast(output);
+    state.monitors.append(state.allocator, temp_monitor) catch unreachable;
+}
+
+fn outputHandleScale(_: ?*anyopaque, _: ?*c.wl_output, scale: i32) callconv(.c) void {
+    temp_monitor.scale = @floatFromInt(scale);
+}
+
+fn outputHandleName(_: ?*anyopaque, _: ?*c.wl_output, name: [*c]const u8) callconv(.c) void {
+    temp_monitor.name = std.mem.span(name);
+}
+
+fn outputHandleDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
+
+const output_listener = c.wl_output_listener{
+    .geometry = outputHandleGeometry,
+    .mode = outputHandleMode,
+    .done = outputHandleDone,
+    .scale = outputHandleScale,
+    .name = outputHandleName,
+    .description = outputHandleDescription,
+};
 
 // --- Layer surface listener ---
 
