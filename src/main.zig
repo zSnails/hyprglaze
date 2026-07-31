@@ -129,11 +129,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
 
-    const mon = ipc.primaryMonitor(allocator) catch |err| {
+    const mon = ipc.getMonitor(allocator, cli.output) catch |err| {
         log.err("failed to query monitor: {}", .{err});
         return err;
     };
-    log.info("monitor: {d}x{d} scale={d:.2}", .{ mon.width, mon.height, mon.scale });
+    log.info("monitor: {d}x{d} scale={d:.2}, position = ({d}, {d})", .{ mon.width, mon.height, mon.scale, mon.x, mon.y });
 
     // Detect Hyprland's workspace animation so switches mirror the
     // compositor's own slide (direction, duration, easing). Refreshed on
