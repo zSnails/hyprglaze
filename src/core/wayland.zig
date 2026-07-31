@@ -1,10 +1,14 @@
 const std = @import("std");
+const hypr = @import("hypr.zig");
+
 const c = @cImport({
     @cInclude("wayland-client.h");
     @cInclude("wayland-egl.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
 });
+
+const log = std.log.scoped(.wayland_state);
 
 pub const WaylandState = struct {
     display: *c.wl_display,
@@ -14,6 +18,8 @@ pub const WaylandState = struct {
     surface: ?*c.wl_surface = null,
     layer_surface: ?*c.zwlr_layer_surface_v1 = null,
     egl_window: ?*c.wl_egl_window = null,
+    allocator: std.mem.Allocator,
+    monitors: std.ArrayList(hypr.MonitorInfo),
 
     configured: bool = false,
     width: u31 = 0,
@@ -21,20 +27,27 @@ pub const WaylandState = struct {
     should_close: bool = false,
     frame_done: bool = true,
     resize_pending: bool = false,
+    must_use_monitor: ?[]const u8 = null,
 
     /// Two-phase init: `self` must be caller-owned storage that outlives
     /// the connection, because its address is registered as listener
     /// userdata — registry events (e.g. monitor hotplug) arrive through
     /// that pointer for the lifetime of the display.
-    pub fn init(self: *WaylandState) !void {
+    pub fn init(self: *WaylandState, allocator: std.mem.Allocator, monitor_name: ?[]const u8) !void {
         const display = c.wl_display_connect(null) orelse return error.DisplayConnectFailed;
         errdefer c.wl_display_disconnect(display);
         const registry = c.wl_display_get_registry(display) orelse return error.RegistryFailed;
         errdefer c.wl_registry_destroy(registry);
 
+        var monitors = try std.ArrayList(hypr.MonitorInfo).initCapacity(allocator, 2);
+        errdefer monitors.deinit(allocator);
+
         self.* = .{
             .display = display,
             .registry = registry,
+            .allocator = allocator,
+            .monitors = monitors,
+            .must_use_monitor = monitor_name,
         };
 
         if (c.wl_registry_add_listener(registry, &registry_listener, self) != 0)
@@ -43,18 +56,36 @@ pub const WaylandState = struct {
         // Round-trip to get globals
         if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
 
+        // NOTE: this roundtrip is needed, the previous one gets the globals,
+        // this one gets the output display geometry, name, mode, etc. It has
+        // to stay.
+        if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
+
         if (self.compositor == null) return error.NoCompositor;
         if (self.layer_shell == null) return error.NoLayerShell;
+    }
+
+    fn getMonitor(self: *WaylandState) ?*c.wl_output {
+        if (self.must_use_monitor) |must_use_monitor| {
+            for (self.monitors.items) |mon| {
+                if (std.mem.eql(u8, mon.name, must_use_monitor)) {
+                    return @ptrCast(mon.output);
+                }
+            }
+        }
+        return null;
     }
 
     pub fn createLayerSurface(self: *WaylandState) !void {
         self.surface = c.wl_compositor_create_surface(self.compositor) orelse
             return error.SurfaceCreateFailed;
 
+        const monitor = self.getMonitor();
+
         self.layer_surface = c.zwlr_layer_shell_v1_get_layer_surface(
             self.layer_shell,
             self.surface,
-            null, // output — null = compositor chooses
+            monitor,
             c.ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
             "hyprglaze",
         ) orelse return error.LayerSurfaceCreateFailed;
@@ -120,6 +151,8 @@ pub const WaylandState = struct {
         self.* = .{
             .display = display,
             .registry = registry,
+            .allocator = self.allocator,
+            .monitors = self.monitors,
         };
 
         if (c.wl_registry_add_listener(registry, &registry_listener, self) != 0)
@@ -137,6 +170,7 @@ pub const WaylandState = struct {
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
+        self.monitors.deinit(self.allocator);
         c.wl_registry_destroy(self.registry);
         c.wl_display_disconnect(self.display);
     }
