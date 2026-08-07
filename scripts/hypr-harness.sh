@@ -182,6 +182,13 @@ apply_layout() {
 }
 apply_layout "$LAYOUT"
 
+# Park the pointer in MON_A's top-left before anything is measured. A cursor
+# sitting on a ring is drawn OVER it (no_hardware_cursors composites the sprite
+# into the output buffer), which breaks the ring into two components and
+# silently truncates every bbox measured from it.
+wl_ptr() { WAYLAND_DISPLAY="$NESTED_WL" wlrctl pointer move "$@"; }
+wl_ptr -100000 -100000
+
 # ---------------------------------------------------------------- helpers ---
 start_daemon() {   # OUTPUT TAG
     env -u DISPLAY WAYLAND_DISPLAY="$NESTED_WL" HYPRLAND_INSTANCE_SIGNATURE="$NESTED_SIG" \
@@ -215,6 +222,24 @@ place() {          # CLASS WS LOCAL_X LOCAL_Y W H   (monitor-local coords)
     E "hl.dispatch(hl.dsp.window.move({ x = $gx, y = $gy, relative = false }))" >/dev/null
     # Never trust the request; the read-back is the ground truth.
     wait_for "[ \"\$(hcj clients | jq -r --arg c '$cls' '.[]|select(.class==\$c)|\"\(.at[0]) \(.at[1]) \(.size[0]) \(.size[1])\"')\" = \"$gx $gy $w $h\" ]" 10
+}
+
+wl_ptr() { WAYLAND_DISPLAY="$NESTED_WL" wlrctl pointer move "$@"; }
+
+# Closed-loop absolute cursor placement in layout coords. wlrctl only moves
+# relatively and the compositor may still massage the delta, so nudge and
+# re-read rather than trusting one move to land.
+move_cursor() {   # GLOBAL_X GLOBAL_Y
+    local want_x=$1 want_y=$2 i cur cx cy dx dy
+    wl_ptr -100000 -100000          # slam to layout (0,0) for a known start
+    for i in $(seq 1 12); do
+        cur=$(hcj cursorpos | jq -r '"\(.x) \(.y)"'); read -r cx cy <<<"$cur"
+        dx=$(( want_x - cx )); dy=$(( want_y - cy ))
+        [ "${dx#-}" -le 1 ] && [ "${dy#-}" -le 1 ] && return 0
+        wl_ptr "$dx" "$dy"
+        sleep 0.15
+    done
+    return 1
 }
 
 shot() { sleep 0.4; WAYLAND_DISPLAY="$NESTED_WL" grim -o "$2" "$OUT/shots/$1.png" 2>>"$OUT/grim.log"; }

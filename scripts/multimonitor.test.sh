@@ -106,10 +106,8 @@ echo "S5  cursor is monitor-local on the offset output"
 # property under test is "crosshair == cursor - origin" — pinning an exact
 # destination would only add a way for the test to fail for reasons unrelated
 # to the daemon.
-wl_ptr() { WAYLAND_DISPLAY="$NESTED_WL" wlrctl pointer move "$@"; }
-wl_ptr -100000 -100000          # slam to layout (0,0)
-wl_ptr $(( BX + 1200 )) $(( BY + 900 ))
-sleep 0.6
+move_cursor $(( BX + 1200 )) $(( BY + 900 )) ||
+    echo "    note: cursor did not converge on the target; asserting where it landed"
 
 read -r gx gy <<<"$(hcj cursorpos | jq -r '"\(.x) \(.y)"')"
 lx=$(( gx - BX )); ly=$(( gy - BY ))

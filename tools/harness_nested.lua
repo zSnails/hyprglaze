@@ -43,7 +43,9 @@ hl.config({
 		damage_tracking = 0, -- full redraw; no partial-damage tearing in a shot
 	},
 
-	input = { kb_layout = "us", follow_mouse = 1, sensitivity = 0 },
+	-- accel_profile flat: relative pointer motion must be 1:1, or wlrctl's
+	-- deltas get accelerated and the cursor lands somewhere else entirely.
+	input = { kb_layout = "us", follow_mouse = 1, sensitivity = 0, accel_profile = "flat" },
 
 	cursor = {
 		no_hardware_cursors = true, -- nested + NVIDIA; also makes `grim -c` work
