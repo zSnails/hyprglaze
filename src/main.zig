@@ -367,13 +367,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Bounded retries for a failed effect resize; see the resize block.
     var resize_retries: u8 = 0;
+    // Set when the surface changed size, to force one re-derive of the cached
+    // window rects: they hold surface-space coordinates flipped about the old
+    // height, and a resize produces no watcher snapshot to trigger that.
+    var surface_resized = false;
 
-    // Main loop
-    while (!wl.should_close and !should_exit.load(.acquire)) {
+    // Main loop.
+    //
+    // `target_gone` is part of the CONDITION, not a check in the body. In the
+    // body it raced `should_close` — an output going away usually closes the
+    // layer surface in the same dispatch, so the condition ended the loop
+    // first and the body never ran. Purely after the loop it was worse: an
+    // output can be removed WITHOUT the surface closing, and then nothing
+    // ended the loop at all and the daemon spun forever on a monitor that no
+    // longer existed. Here, whichever happens first stops the loop, and the
+    // check after it decides how to exit.
+    while (!wl.should_close and !wl.target_gone and !should_exit.load(.acquire)) {
         wl.dispatch() catch |err| {
             if (should_exit.load(.acquire)) break;
             log.warn("Wayland dispatch error: {} — reconnecting in 1s", .{err});
             iohelp.sleepNs(1 * std.time.ns_per_s);
+            // Tear EGL down BEFORE reconnect, which destroys the wl_display
+            // the EGL surface is built on. Leaving it until afterwards means
+            // eglDestroySurface — from recreateGraphics on the way in, or from
+            // this function's own `defer` if the reconnect fails — walks into
+            // a freed display inside the driver's Wayland platform layer and
+            // segfaults. deinit is idempotent, so the later calls are no-ops.
+            egl_state.deinit();
             wl.reconnect() catch |e2| {
                 log.err("Wayland reconnect failed: {} — exiting", .{e2});
                 return e2;
@@ -403,6 +423,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             surf_w = new_w;
             surf_h = new_h;
             surf_scale = wl.scale();
+            // Window rects are cached in surface space, and the y-flip that
+            // produced them used the OLD height. Nothing else re-derives them:
+            // a resize emits no new watcher snapshot, so without this the
+            // rects stay flipped about the previous surface for as long as no
+            // window happens to move — every effect drawing them off by the
+            // difference between the two heights.
+            if (dims_changed) surface_resized = true;
             if (dims_changed and !rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h)) {
                 // A transient failure (an FBO allocation losing a race with
                 // something else on the GPU) would otherwise strand the effect
@@ -495,7 +522,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // every 16ms tick and pushes a fresh snapshot.
             const gen = events.snapshotGen();
             var force_snap = false;
-            if (focus_changed or gen != last_snapshot_gen) {
+            if (focus_changed or gen != last_snapshot_gen or surface_resized) {
+                surface_resized = false;
                 if (gen != last_snapshot_gen) {
                     last_snapshot_gen = gen;
                     events.copySnapshot(&cached_snapshot);

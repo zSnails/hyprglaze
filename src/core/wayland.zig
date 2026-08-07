@@ -290,6 +290,13 @@ pub const WaylandState = struct {
         if (c.wl_display_dispatch(self.display) == -1) return error.DispatchFailed;
     }
 
+    /// True once the pinned output has gone away. Losing it does not always
+    /// close the layer surface, so this is what the main loop watches to know
+    /// it has nothing left to draw on.
+    pub fn targetGone(self: *const WaylandState) bool {
+        return self.target_gone;
+    }
+
     /// Tear down Wayland-side resources and reconnect to the compositor.
     /// On success, a fresh display/registry/compositor/layer_shell/surface/egl_window
     /// is live. Caller must recreate EGL state and re-upload GL resources since the

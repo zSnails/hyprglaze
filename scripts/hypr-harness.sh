@@ -282,6 +282,39 @@ move_cursor() {   # GLOBAL_X GLOBAL_Y
     return 1
 }
 
+# The probe shader draws its ring PAD(12) + TH(2) = 14px outside the window
+# rect. The daemon flips into GL space (y up) and grim writes rows top-down, so
+# the two flips cancel: a window at monitor-local (x, y, w, h) yields a ring
+# bbox of (x-14, y-14)..(x+w+13, y+h+13) in PNG coordinates. The far edges land
+# a pixel inside because the shader's band test is inclusive at both ends.
+ring_x0() { echo $(( $1 - 14 )); }
+ring_y0() { echo $(( $1 - 14 )); }
+ring_x1() { echo $(( $1 + $2 + 13 )); }
+ring_y1() { echo $(( $1 + $2 + 13 )); }
+
+# Wait for a child to exit and capture its status in EXIT_CODE.
+# `kill -0` is not enough: an exited child stays a zombie until reaped and
+# answers it happily, so a poll on that alone reports a dead daemon as running.
+wait_exit() {   # PID [SECS] -> EXIT_CODE, or signals a timeout with EXIT_CODE=-1
+    local pid=$1 deadline=$(( SECONDS + ${2:-15} )) st
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        st=$(awk '/^State:/{print $2}' "/proc/$pid/status" 2>/dev/null) || st=gone
+        [ -z "$st" ] && st=gone
+        if [ "$st" = gone ] || [ "$st" = Z ]; then
+            # Only reap once it has actually finished. `wait` on a live child
+            # blocks with no timeout, which turns a failed assertion into a
+            # hung run and a nested compositor left on the user's screen.
+            wait "$pid" 2>/dev/null
+            EXIT_CODE=$?
+            return 0
+        fi
+        sleep 0.25
+    done
+    echo "    (pid $pid still running after ${2:-15}s)" >&2
+    EXIT_CODE=-1
+    return 1
+}
+
 shot() { sleep 0.4; WAYLAND_DISPLAY="$NESTED_WL" grim -o "$2" "$OUT/shots/$1.png" 2>>"$OUT/grim.log"; }
 scan() { python3 tools/harness_scan.py "$1" "$2"; }
 

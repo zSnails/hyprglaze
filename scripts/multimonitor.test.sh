@@ -4,16 +4,7 @@
 #   scripts/hypr-harness.sh scripts/multimonitor.test.sh
 #   HG_LAYOUT=y scripts/hypr-harness.sh scripts/multimonitor.test.sh
 #
-# The probe shader draws a ring PAD(12) + TH(2) = 14px outside each window
-# rect. The daemon flips into GL space (y up) and grim writes rows top-down,
-# so the two flips cancel: a window at monitor-local (x, y, w, h) produces a
-# ring whose bbox is (x-14, y-14) .. (x+w+13, y+h+13) in PNG coordinates --
-# the near edges land on x-14 exactly, the far ones a pixel inside x+w+14
-# because the shader's band test is inclusive at both ends.
-ring_x0() { echo $(( $1 - 14 )); }
-ring_y0() { echo $(( $1 - 14 )); }
-ring_x1() { echo $(( $1 + $2 + 13 )); }
-ring_y1() { echo $(( $1 + $2 + 13 )); }
+# ring_x0/ring_y0/ring_x1/ring_y1 come from the harness.
 
 echo
 echo "S0  monitor origins are logical, not physical"
