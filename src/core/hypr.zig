@@ -43,6 +43,12 @@ pub const VisibleWindows = struct {
     /// window set, so a workspace switch can never race its geometry).
     /// 0 = unknown: old-format watcher payload or parse failure.
     workspace_id: i64 = 0,
+    /// Layout-space origin of the monitor this snapshot describes. Window
+    /// rects arrive as global layout coords; subtracting this makes them
+    /// surface-local. Carried inside the snapshot so a monitor that moves
+    /// can never leave rects rebased against a stale origin.
+    origin_x: i32 = 0,
+    origin_y: i32 = 0,
 };
 
 /// Effective workspace-animation config detected from Hyprland, used to
@@ -151,8 +157,14 @@ pub const HyprIpc = struct {
     /// Lua config manager (Hyprland ≥0.55). Returns error.EvalRejected
     /// when the compositor reports anything other than "ok" — typically a
     /// Lua error, or a classic hyprlang config where eval is unsupported.
+    /// Upper bound on a chunk this can send. watcher.lua is the only caller
+    /// and sits well inside it; the headroom is so its documentation header
+    /// never has to be traded against the buffer size.
+    pub const max_eval_chunk = eval_cmd_buf_len - "eval ".len;
+    const eval_cmd_buf_len = 16384;
+
     pub fn eval(self: *const HyprIpc, code: []const u8) !void {
-        var cmd_buf: [8192]u8 = undefined;
+        var cmd_buf: [eval_cmd_buf_len]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "eval {s}", .{code}) catch return error.CodeTooLong;
 
         // Roomy enough for a multi-line Lua traceback: truncating the error

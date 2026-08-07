@@ -41,9 +41,47 @@ def main() -> int:
         print("none")
         return 0
 
-    ys, xs = np.nonzero(mask)
-    print(f"{xs.min()} {ys.min()} {xs.max()} {ys.max()} {mask.sum()}")
+    # Largest connected component, not the global bounding box. Layers above
+    # the background one -- Hyprland's error overlay, notifications -- also
+    # land in the screenshot, and a few stray pixels near the top edge would
+    # otherwise stretch the box and quietly turn a passing measurement into a
+    # failing one.
+    ys, xs = largest_component(mask)
+    print(f"{xs.min()} {ys.min()} {xs.max()} {ys.max()} {len(xs)}")
     return 0
+
+
+def largest_component(mask):
+    """Coordinates of the biggest 4-connected blob in a boolean mask.
+
+    Hand-rolled rather than scipy.ndimage.label so the harness needs nothing
+    beyond numpy and Pillow.
+    """
+    h, w = mask.shape
+    seen = np.zeros_like(mask, dtype=bool)
+    best: tuple[np.ndarray, np.ndarray] | None = None
+    best_size = 0
+
+    for sy, sx in zip(*np.nonzero(mask)):
+        if seen[sy, sx]:
+            continue
+        stack = [(int(sy), int(sx))]
+        seen[sy, sx] = True
+        pts = []
+        while stack:
+            y, x = stack.pop()
+            pts.append((y, x))
+            for ny, nx in ((y - 1, x), (y + 1, x), (y, x - 1), (y, x + 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] and not seen[ny, nx]:
+                    seen[ny, nx] = True
+                    stack.append((ny, nx))
+        if len(pts) > best_size:
+            best_size = len(pts)
+            arr = np.array(pts)
+            best = (arr[:, 0], arr[:, 1])
+
+    assert best is not None
+    return best
 
 
 if __name__ == "__main__":

@@ -1,0 +1,22 @@
+[Unit]
+Description=hyprglaze shader wallpaper daemon (%I)
+Documentation=https://github.com/slastra/hyprglaze
+PartOf=graphical-session.target
+After=graphical-session.target
+
+# One instance per monitor:
+#   systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
+# Names come from `hyprctl monitors -j | jq -r '.[].name'`. Do not enable
+# hyprglaze.service alongside this for the same screen — both would render.
+
+[Service]
+Type=simple
+# %I rather than %i: identical for a plain connector name, but it also
+# survives an escaped instance name.
+ExecStart=/usr/bin/hyprglaze --output %I
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical-session.target

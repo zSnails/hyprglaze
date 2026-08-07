@@ -39,4 +39,5 @@ package() {
 
     # Systemd user unit
     install -Dm644 contrib/hyprglaze.service "$pkgdir/usr/lib/systemd/user/hyprglaze.service"
+    install -Dm644 "contrib/hyprglaze@.service" "$pkgdir/usr/lib/systemd/user/hyprglaze@.service"
 }

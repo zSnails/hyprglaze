@@ -203,8 +203,13 @@ place() {          # CLASS WS LOCAL_X LOCAL_Y W H   (monitor-local coords)
         foot --app-id="$cls" >/dev/null 2>&1 &
     CLIENT_PIDS+=($!)
     wait_for "hcj clients | jq -e --arg c '$cls' '.[]|select(.class==\$c)' >/dev/null" 15
-    E "for _,w in ipairs(hl.get_windows()) do if w.class=='$cls' then hl.dispatch(hl.dsp.window.move({ workspace = $ws })) end end" >/dev/null
+    # Every window dispatcher below acts on the ACTIVE window, so the new
+    # window must actually be focused first — mapping and focusing are
+    # separate events, and dispatching between them moves the wrong window.
+    wait_for "[ \"\$(hcj activewindow | jq -r .class)\" = '$cls' ]" 10
+    E "hl.dispatch(hl.dsp.window.move({ workspace = $ws }))" >/dev/null
     sleep 0.4
+    wait_for "[ \"\$(hcj activewindow | jq -r .class)\" = '$cls' ]" 10
     E "hl.dispatch(hl.dsp.window.float({ action = 'on' }))" >/dev/null; sleep 0.4
     E "hl.dispatch(hl.dsp.window.resize({ x = $w, y = $h, relative = false }))" >/dev/null; sleep 0.4
     E "hl.dispatch(hl.dsp.window.move({ x = $gx, y = $gy, relative = false }))" >/dev/null

@@ -64,6 +64,29 @@ pub const HyprEvents = struct {
     /// recreated on reload, killing the watcher — the main loop reinstalls.
     config_dirty: std.atomic.Value(bool) = .init(false),
 
+    /// A legacy (non-per-monitor) `hg:geo` arrived while a monitor filter is
+    /// set: an older hyprglaze installed its watcher over ours. Its payload
+    /// is not monitor-scoped, so the main loop reinstalls rather than
+    /// consuming another monitor's windows.
+    legacy_watcher: std.atomic.Value(bool) = .init(false),
+
+    /// Output this daemon renders on. `hg:mgeo` events for other monitors
+    /// are dropped, which is what lets one watcher serve one daemon per
+    /// monitor. Length 0 accepts every monitor (tests, and the untargeted
+    /// case).
+    monitor_name: [64]u8 = undefined,
+    monitor_name_len: u8 = 0,
+
+    pub fn monitorName(self: *const HyprEvents) []const u8 {
+        return self.monitor_name[0..self.monitor_name_len];
+    }
+
+    /// Scope this daemon to one output. Must be called before `start`.
+    pub fn setMonitor(self: *HyprEvents, name: []const u8) void {
+        self.monitor_name_len = @intCast(@min(name.len, self.monitor_name.len));
+        @memcpy(self.monitor_name[0..self.monitor_name_len], name[0..self.monitor_name_len]);
+    }
+
     pub fn init() !HyprEvents {
         const xdg_z = std.c.getenv("XDG_RUNTIME_DIR") orelse return error.NoXdgRuntime;
         const xdg = std.mem.span(xdg_z);
@@ -103,6 +126,7 @@ pub const HyprEvents = struct {
         resync: bool = false,
         monitor: bool = false,
         config: bool = false,
+        legacy: bool = false,
     };
 
     /// Snapshot and clear all dirty flags atomically. The flags rearm on
@@ -112,6 +136,7 @@ pub const HyprEvents = struct {
             .resync = self.resync_needed.swap(false, .acq_rel),
             .monitor = self.monitor_dirty.swap(false, .acq_rel),
             .config = self.config_dirty.swap(false, .acq_rel),
+            .legacy = self.legacy_watcher.swap(false, .acq_rel),
         };
     }
 
@@ -276,7 +301,31 @@ fn handleCustom(self: *HyprEvents, data: []const u8) void {
         return;
     }
 
+    if (std.mem.startsWith(u8, data, "hg:mgeo:")) {
+        const payload = data["hg:mgeo:".len..];
+        // Reject another monitor's event before parsing any records: with
+        // one watcher serving every daemon, most traffic is not ours.
+        const gi = std.mem.indexOfScalar(u8, payload, group_sep) orelse return;
+        if (self.monitor_name_len != 0 and
+            !std.mem.eql(u8, payload[0..gi], self.monitorName())) return;
+
+        const snap = parseGeoM(payload[gi + 1 ..]);
+        lockSpin(&self.snapshot_mutex);
+        self.snapshot = snap;
+        self.snapshot_mutex.unlock();
+        _ = self.snapshot_gen.fetchAdd(1, .acq_rel);
+        return;
+    }
+
     if (std.mem.startsWith(u8, data, "hg:geo:")) {
+        // A pre-per-monitor watcher is installed, which means an older
+        // hyprglaze is running and overwrote ours. Its payload is not scoped
+        // to a monitor, so consuming it would silently mix monitors —
+        // flag a reinstall instead and let the newer daemon win.
+        if (self.monitor_name_len != 0) {
+            self.legacy_watcher.store(true, .release);
+            return;
+        }
         const snap = parseGeo(data["hg:geo:".len..]);
         lockSpin(&self.snapshot_mutex);
         self.snapshot = snap;
@@ -314,7 +363,40 @@ fn parseGeo(payload: []const u8) hypr.VisibleWindows {
         result.workspace_id = std.fmt.parseInt(i64, payload[0..gi], 10) catch 0;
         records_payload = payload[gi + 1 ..];
     }
-    if (records_payload.len == 0) return result;
+    parseRecords(records_payload, &result);
+    return result;
+}
+
+/// Parse the monitor-scoped tail of an `hg:mgeo` payload — everything after
+/// the output name: `<wsid> \x1D <ox> \x1D <oy> \x1D <records>`.
+///
+/// The origin travels with the geometry it describes, so a monitor that moves
+/// (a display added to its left, say) cannot leave window rects rebased
+/// against a stale origin even for one frame.
+fn parseGeoM(payload: []const u8) hypr.VisibleWindows {
+    var result = hypr.VisibleWindows{};
+
+    var rest = payload;
+
+    // wsid
+    var gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    result.workspace_id = std.fmt.parseInt(i64, rest[0..gi], 10) catch 0;
+    rest = rest[gi + 1 ..];
+    // origin x
+    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    result.origin_x = std.fmt.parseInt(i32, rest[0..gi], 10) catch 0;
+    rest = rest[gi + 1 ..];
+    // origin y
+    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    result.origin_y = std.fmt.parseInt(i32, rest[0..gi], 10) catch 0;
+    rest = rest[gi + 1 ..];
+
+    parseRecords(rest, &result);
+    return result;
+}
+
+fn parseRecords(records_payload: []const u8, result: *hypr.VisibleWindows) void {
+    if (records_payload.len == 0) return;
 
     var records = std.mem.splitScalar(u8, records_payload, record_sep);
     while (records.next()) |rec| {
@@ -353,8 +435,6 @@ fn parseGeo(payload: []const u8) hypr.VisibleWindows {
         result.windows[result.count] = win;
         result.count += 1;
     }
-
-    return result;
 }
 
 fn lockSpin(m: *std.atomic.Mutex) void {
@@ -570,4 +650,116 @@ test "takeDirty clears flags" {
     const d2 = ev.takeDirty();
     try std.testing.expect(!d2.resync);
     try std.testing.expect(!d2.monitor);
+}
+
+// --- per-monitor geometry (hg:mgeo) ---
+
+fn scopedEvents(name: []const u8) HyprEvents {
+    var ev = testEvents();
+    ev.setMonitor(name);
+    return ev;
+}
+
+/// `<mon> GS <wsid> GS <ox> GS <oy> GS <records>`
+const mgeo_dp1 = "custom>>hg:mgeo:DP-1\x1d3\x1d3072\x1d0\x1d" ++
+    "0x1a2b\x1f3172\x1f200\x1f800\x1f600\x1fkitty\x1f~ — fish\x1f0";
+
+test "handleLine hg:mgeo parses the header, origin and records" {
+    var ev = scopedEvents("DP-1");
+    handleLine(&ev, mgeo_dp1);
+
+    try std.testing.expectEqual(@as(u64, 1), ev.snapshotGen());
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, 3), snap.workspace_id);
+    try std.testing.expectEqual(@as(i32, 3072), snap.origin_x);
+    try std.testing.expectEqual(@as(i32, 0), snap.origin_y);
+    try std.testing.expectEqual(@as(u8, 1), snap.count);
+    // Wire coordinates stay global; rebasing happens in geometry.zig.
+    try std.testing.expectEqual(@as(i32, 3172), snap.windows[0].x);
+    try std.testing.expectEqualStrings("kitty", snap.windows[0].className());
+}
+
+test "handleLine hg:mgeo for another monitor is ignored entirely" {
+    // The core multi-instance guarantee: one watcher serves every daemon, so
+    // each must drop the others' events without touching its own state.
+    var ev = scopedEvents("HDMI-A-1");
+    handleLine(&ev, mgeo_dp1);
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(u8, 0), snap.count);
+}
+
+test "handleLine hg:mgeo with no monitor filter accepts any monitor" {
+    var ev = testEvents();
+    handleLine(&ev, mgeo_dp1);
+    try std.testing.expectEqual(@as(u64, 1), ev.snapshotGen());
+}
+
+test "handleLine hg:mgeo a monitor name must match exactly, not by prefix" {
+    var ev = scopedEvents("DP-11");
+    handleLine(&ev, mgeo_dp1);
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+}
+
+test "handleLine hg:mgeo empty record section is a valid zero-window snapshot" {
+    var ev = scopedEvents("DP-1");
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1d7\x1d-1920\x1d1080\x1d");
+    try std.testing.expectEqual(@as(u64, 1), ev.snapshotGen());
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(u8, 0), snap.count);
+    try std.testing.expectEqual(@as(i32, -1920), snap.origin_x);
+    try std.testing.expectEqual(@as(i32, 1080), snap.origin_y);
+}
+
+test "handleLine hg:mgeo truncated headers do not bump the generation" {
+    var ev = scopedEvents("DP-1");
+    handleLine(&ev, "custom>>hg:mgeo:DP-1"); // no separator at all
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+
+    // A header that stops before the origin yields a snapshot with no
+    // windows rather than one rebased against a half-parsed origin.
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1d3");
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(u8, 0), snap.count);
+    try std.testing.expectEqual(@as(i32, 0), snap.origin_x);
+
+    // Garbage in the numeric fields degrades to zero, never a crash.
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1dx\x1dy\x1dz\x1d");
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
+    try std.testing.expectEqual(@as(i32, 0), snap.origin_x);
+}
+
+test "handleLine legacy hg:geo while scoped triggers a reinstall instead of mixing monitors" {
+    var ev = scopedEvents("DP-1");
+    handleLine(&ev, "custom>>hg:geo:0x1\x1f0\x1f0\x1f10\x1f10\x1fa\x1fb");
+    // The legacy payload is not monitor-scoped, so consuming it would render
+    // another monitor's windows. State must be untouched.
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+    try std.testing.expect(ev.takeDirty().legacy);
+}
+
+test "handleLine hg:mgeo honours the 32-window cap" {
+    var ev = scopedEvents("DP-1");
+    var buf: [4096]u8 = undefined;
+    var end: usize = 0;
+    const header = "custom>>hg:mgeo:DP-1\x1d1\x1d0\x1d0\x1d";
+    @memcpy(buf[0..header.len], header);
+    end = header.len;
+    for (0..40) |i| {
+        if (i > 0) {
+            buf[end] = 0x1e;
+            end += 1;
+        }
+        const rec = try std.fmt.bufPrint(buf[end..], "0x{x}\x1f{d}\x1f0\x1f10\x1f10\x1fc\x1ft\x1f0", .{ i + 1, i });
+        end += rec.len;
+    }
+    handleLine(&ev, buf[0..end]);
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(u8, hypr.max_visible_windows), snap.count);
 }

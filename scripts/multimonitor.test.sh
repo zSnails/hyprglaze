@@ -6,8 +6,14 @@
 #
 # The probe shader draws a ring PAD(12) + TH(2) = 14px outside each window
 # rect. The daemon flips into GL space (y up) and grim writes rows top-down,
-# so the two flips cancel: a window at monitor-local (x, y, w, h) must produce
-# a ring bbox of exactly (x-14, y-14) .. (x+w+14, y+h+14) in PNG coordinates.
+# so the two flips cancel: a window at monitor-local (x, y, w, h) produces a
+# ring whose bbox is (x-14, y-14) .. (x+w+13, y+h+13) in PNG coordinates --
+# the near edges land on x-14 exactly, the far ones a pixel inside x+w+14
+# because the shader's band test is inclusive at both ends.
+ring_x0() { echo $(( $1 - 14 )); }
+ring_y0() { echo $(( $1 - 14 )); }
+ring_x1() { echo $(( $1 + $2 + 13 )); }
+ring_y1() { echo $(( $1 + $2 + 13 )); }
 
 echo
 echo "S0  monitor origins are logical, not physical"
@@ -36,24 +42,37 @@ echo "S2  window rects are monitor-local on an offset output"
 place probe-b 11 300 200 500 400
 shot s2_b WAYLAND-2
 read -r x0 y0 x1 y1 _ <<<"$(ring_of "$OUT/shots/s2_b.png")"
-echo "    ring bbox=($x0,$y0)..($x1,$y1)  expected=(286,186)..(814,614)"
-if [ "$x0" -ne 286 ]; then
-    echo "    delta_x=$(( x0 - 286 ))  MON_B origin_x=$BX" \
-         "$([ $(( x0 - 286 )) -eq "$BX" ] && echo '<- equals the origin: layout coords reach the shader unrebased')"
+e_x0=$(ring_x0 300); e_y0=$(ring_y0 200)
+e_x1=$(ring_x1 300 500); e_y1=$(ring_y1 200 400)
+echo "    ring bbox=($x0,$y0)..($x1,$y1)  expected=($e_x0,$e_y0)..($e_x1,$e_y1)"
+if [ "$x0" -ne "$e_x0" ]; then
+    echo "    delta_x=$(( x0 - e_x0 ))  MON_B origin_x=$BX" \
+         "$([ $(( x0 - e_x0 )) -eq "$BX" ] && echo '<- equals the origin: layout coords reach the shader unrebased')"
 fi
-expect "[ $x0 -eq 286 ]" "ring left edge at window_x - 14"
-expect "[ $y0 -eq 186 ]" "ring top edge at window_y - 14"
-expect "[ $x1 -eq 814 ]" "ring right edge at window_x + w + 14"
-expect "[ $y1 -eq 614 ]" "ring bottom edge at window_y + h + 14"
+expect "[ $x0 -eq $e_x0 ]" "ring left edge at window_x - 14"
+expect "[ $y0 -eq $e_y0 ]" "ring top edge at window_y - 14"
+expect "[ $x1 -eq $e_x1 ]" "ring right edge tracks window width"
+expect "[ $y1 -eq $e_y1 ]" "ring bottom edge tracks window height"
 
 echo
 echo "S3  the tracked window set is pinned, not focus-following"
 shot s3_focus_b WAYLAND-2
 place probe-a 1 100 100 300 200
+# Focus workspace 1, which the nested config pins to WAYLAND-1. Explicit
+# rather than relying on the placement above having left focus there.
+E "hl.dispatch(hl.dsp.focus({ workspace = 1 }))" >/dev/null
 wait_for "[ \"\$(hcj monitors | jq -r '.[]|select(.focused)|.name')\" = WAYLAND-1 ]" 10
 shot s3_focus_a WAYLAND-2
-expect "cmp -s $OUT/shots/s3_focus_b.png $OUT/shots/s3_focus_a.png" \
-       "WAYLAND-2 is unchanged when focus moves to WAYLAND-1"
+# Compare the tracked geometry, not the bytes: the ring legitimately changes
+# colour (red -> green) when focus leaves this monitor, so a byte compare
+# would fail on correct behaviour. What must not change is WHICH window is
+# traced -- before per-monitor events, this ring jumped to MON_A's window.
+read -r bx0 by0 bx1 by1 _ <<<"$(ring_of "$OUT/shots/s3_focus_b.png")"
+read -r ax0 ay0 ax1 ay1 _ <<<"$(ring_of "$OUT/shots/s3_focus_a.png")"
+echo "    focus on B: ($bx0,$by0)..($bx1,$by1)   focus on A: ($ax0,$ay0)..($ax1,$ay1)"
+expect "[ '$ax0 $ay0 $ax1 $ay1' = '$bx0 $by0 $bx1 $by1' ]" \
+       "WAYLAND-2 keeps tracing its own window when focus moves to WAYLAND-1"
+expect "[ '$ax0' = '$(ring_x0 300)' ]" "...and it is still MON_B's window, not MON_A's"
 
 echo
 echo "S4  two instances, one per monitor, each tracking only its own"
@@ -63,11 +82,14 @@ shot s4_a_dual WAYLAND-1
 shot s4_b_dual WAYLAND-2
 read -r ax0 ay0 _ _ _ <<<"$(ring_of "$OUT/shots/s4_a_dual.png")"
 read -r bx0 by0 _ _ _ <<<"$(ring_of "$OUT/shots/s4_b_dual.png")"
-# A's window is at A-local (100,100); B's is at B-local (300,200).
-expect "[ '$ax0' = '86'  ]" "WAYLAND-1 instance tracks its own window (x-14=86)"
-expect "[ '$bx0' = '286' ]" "WAYLAND-2 instance tracks its own window (x-14=286)"
-expect "[ '$ay0' = '86'  ]" "WAYLAND-1 instance y is local too"
-expect "[ '$by0' = '186' ]" "WAYLAND-2 instance y is local too"
+# A's window is at A-local (100,100); B's is at B-local (300,200). Assert the
+# window CONTENTS per instance, not just that both render: before per-monitor
+# events both daemons carried the same global set, so a weaker check passed
+# while nothing actually worked.
+expect "[ '$ax0' = '$(ring_x0 100)' ]" "WAYLAND-1 instance tracks its own window"
+expect "[ '$bx0' = '$(ring_x0 300)' ]" "WAYLAND-2 instance tracks its own window"
+expect "[ '$ay0' = '$(ring_y0 100)' ]" "WAYLAND-1 instance y is local too"
+expect "[ '$by0' = '$(ring_y0 200)' ]" "WAYLAND-2 instance y is local too"
 # The second install must not have killed the first daemon's watcher timer.
 sleep 12
 expect "! grep -qi 'heartbeat' $OUT/hyprglaze-a.log" "no watcher reinstall storm on instance A"
@@ -76,7 +98,9 @@ expect "! grep -qi 'heartbeat' $OUT/hyprglaze-b.log" "no watcher reinstall storm
 echo
 echo "S5  cursor is monitor-local on the offset output"
 E "hl.dispatch(hl.dsp.cursor.move({ x = $(( BX + 400 )), y = $(( BY + 300 )) }))" >/dev/null
-wait_for "[ \"\$(hcj cursorpos)\" = \"$(( BX + 400 )), $(( BY + 300 ))\" ]" 5
+# `hyprctl cursorpos` prints "x, y"; the -j form returns an object, so read
+# the fields rather than string-matching the JSON.
+wait_for "[ \"\$(hcj cursorpos | jq -r '\"\\(.x),\\(.y)\"')\" = \"$(( BX + 400 )),$(( BY + 300 ))\" ]" 8
 shot s5_b WAYLAND-2
 read -r cx0 cy0 cx1 cy1 _ <<<"$(scan "$OUT/shots/s5_b.png" blue)"
 expect "[ $(( (cx0 + cx1) / 2 )) -eq 400 ]" "crosshair x is MON_B-local 400"

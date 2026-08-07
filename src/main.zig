@@ -7,6 +7,7 @@ const shader_mod = @import("core/shader.zig");
 const hypr = @import("core/hypr.zig");
 const palette_mod = @import("core/palette.zig");
 const transition = @import("core/transition.zig");
+const geometry = @import("core/geometry.zig");
 const workspace_slide = @import("core/workspace_slide.zig");
 const config_mod = @import("core/config.zig");
 const watcher_mod = @import("core/watcher.zig");
@@ -266,6 +267,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const initial_addr: u64 = if (initial_focus) |w| w.address else 0;
     events.focused_address.store(initial_addr, .release);
 
+    // Scope the event stream to our output before the reader exists: the
+    // shared watcher emits one geometry event per monitor and every other
+    // monitor's is dropped. Seed the origin from the startup query so the
+    // first frames are already rebased; from the first watcher event on, the
+    // origin arrives with the geometry it describes.
+    events.setMonitor(mon.outputName());
+    events.snapshot.origin_x = mon.x;
+    events.snapshot.origin_y = mon.y;
+
     // Start the reader, then install the in-compositor Lua watcher. Its
     // first tick emits cursor + geometry unconditionally, so waiting
     // briefly for the first snapshot gives us a real seed state.
@@ -285,16 +295,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.warn("no snapshot from watcher within 300ms — starting with empty state", .{});
     _ = events.takeDirty(); // clear the initial resync flag — we just installed
 
-    const initial_cursor = events.cursorPos();
-    const seed_cursor = [2]f32{
-        @floatFromInt(initial_cursor.x),
-        surf_h - @as(f32, @floatFromInt(initial_cursor.y)),
-    };
-
+    // The snapshot must be read before the cursor is seeded: the cursor is
+    // rebased against the monitor origin the snapshot carries.
     var cached_snapshot = hypr.VisibleWindows{};
     var last_snapshot_gen = events.snapshotGen();
     events.copySnapshot(&cached_snapshot);
     slide.seed(cached_snapshot.workspace_id);
+
+    const initial_cursor = events.cursorPos();
+    const seed_cursor = geometry.toGlPoint(
+        initial_cursor.x,
+        initial_cursor.y,
+        cached_snapshot.origin_x,
+        cached_snapshot.origin_y,
+        surf_h,
+        1.0,
+    );
 
     const raw0 = deriveRawState(
         &cached_snapshot,
@@ -383,8 +399,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Cursor arrives as push (`hg:cur` events) — reading the
             // atomics is free, so sample every frame.
             const cursor = events.cursorPos();
-            cached_cursor[0] = @floatFromInt(cursor.x);
-            cached_cursor[1] = surf_h - @as(f32, @floatFromInt(cursor.y));
+            cached_cursor = geometry.toGlPoint(
+                cursor.x,
+                cursor.y,
+                cached_snapshot.origin_x,
+                cached_snapshot.origin_y,
+                surf_h,
+                1.0,
+            );
             const raw_cursor = cached_cursor;
 
             // Pull focus from the event stream. A change forces an
@@ -396,7 +418,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const dirty = events.takeDirty();
             if (dirty.monitor) {
-                log.info("monitor topology changed — restart hyprglaze if displays are reconfigured", .{});
+                // No re-query needed: the origin is part of the watcher's
+                // change key, so a monitor appearing to our left re-emits our
+                // geometry with the corrected origin within one 16ms tick,
+                // window event or not.
+                log.info("monitor topology changed", .{});
+            }
+            if (wl.target_gone) {
+                log.err("output '{s}' was removed — exiting", .{wl.targetName()});
+                break;
             }
             // Config reload recreates Hyprland's Lua state (killing the
             // watcher); a socket2 reconnect means change-only events may
@@ -404,9 +434,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // which re-emits the full state on its first tick. The
             // heartbeat lapse catches anything else that kills the watcher.
             const hb_stale = hypr_events.nowMs() - events.lastHeartbeatMs() > hb_lapse_ms;
-            if ((dirty.config or dirty.resync or hb_stale) and time_f64 - last_install_attempt >= reinstall_min_gap) {
+            if ((dirty.config or dirty.resync or dirty.legacy or hb_stale) and time_f64 - last_install_attempt >= reinstall_min_gap) {
                 last_install_attempt = time_f64;
                 if (dirty.config) log.info("Hyprland reloaded its config — reinstalling watcher", .{});
+                if (dirty.legacy) log.warn("an older hyprglaze replaced the watcher — reinstalling", .{});
                 if (hb_stale) log.warn("watcher heartbeat lapsed — reinstalling", .{});
                 installWatcher(&ipc, &events) catch |err| {
                     log.warn("watcher reinstall failed: {} — retrying in {d}s", .{ err, @as(u32, @intFromFloat(reinstall_min_gap)) });
@@ -724,6 +755,13 @@ const RawState = struct {
 /// state. Pushes `custom>>hg:*` events on socket2 (see hypr_events.zig).
 const watcher_lua = @embedFile("core/watcher.lua");
 
+comptime {
+    // An over-budget chunk is otherwise a runtime error.CodeTooLong,
+    // discovered only against a live compositor.
+    if (watcher_lua.len > hypr.HyprIpc.max_eval_chunk)
+        @compileError("watcher.lua exceeds HyprIpc.eval's command buffer");
+}
+
 /// (Re)install the watcher. Idempotent — the chunk disables any previous
 /// timer first, and its first tick re-emits cursor + geometry
 /// unconditionally. Seeds the heartbeat clock so the lapse detector
@@ -758,11 +796,21 @@ fn deriveRawState(
         const vw = visible.windows[i];
         if (axis == .none and vw.rel != 0) continue;
         const out = count;
+        const r = geometry.toGl(
+            vw.x,
+            vw.y,
+            vw.w,
+            vw.h,
+            visible.origin_x,
+            visible.origin_y,
+            surf_h,
+            1.0,
+        );
         windows[out] = .{
-            .x = @floatFromInt(vw.x),
-            .y = surf_h - (@as(f32, @floatFromInt(vw.y)) + @as(f32, @floatFromInt(vw.h))),
-            .w = @floatFromInt(vw.w),
-            .h = @floatFromInt(vw.h),
+            .x = r.x,
+            .y = r.y,
+            .w = r.w,
+            .h = r.h,
             .address = vw.address,
         };
         applyOffset(&windows[out].x, &windows[out].y, axis, @as(f32, @floatFromInt(vw.rel)) * span);
