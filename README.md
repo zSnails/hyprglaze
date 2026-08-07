@@ -7,6 +7,7 @@ A wallpaper daemon for Hyprland that renders GLSL shaders and modular effects on
 ## Features
 
 - Renders behind all windows via wlr-layer-shell, on a chosen monitor or one instance per monitor
+- Draws at the monitor's native resolution on scaled displays, via fractional-scale and viewporter
 - Shadertoy-compatible GLSL uniforms (iResolution, iTime, iMouse, iWindow)
 - Passes every visible window to shaders with smooth position tracking and identity-based focus
 - Receives compositor state as push events from a small Lua watcher installed inside Hyprland, so geometry stays live even mid-drag and nothing is ever polled

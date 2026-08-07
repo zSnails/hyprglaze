@@ -5,6 +5,8 @@ const c = @cImport({
     @cInclude("wayland-egl.h");
     @cInclude("xdg-shell-client-protocol.h");
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
+    @cInclude("viewporter-client-protocol.h");
+    @cInclude("fractional-scale-v1-client-protocol.h");
 });
 
 const log = std.log.scoped(.wayland);
@@ -40,6 +42,31 @@ pub const WaylandState = struct {
     layer_surface: ?*c.zwlr_layer_surface_v1 = null,
     egl_window: ?*c.wl_egl_window = null,
 
+    // --- HiDPI ---
+    //
+    // The layer surface is configured in *logical* pixels. Rendering a buffer
+    // of that size and letting the compositor upscale costs real resolution:
+    // a 3840x2160 monitor at scale 1.25 is configured 3072x1728, so a third of
+    // the pixels never get drawn. Instead we render at
+    // `logical * scale` and hand the surface a viewport whose destination is
+    // the logical size.
+    viewporter: ?*c.wp_viewporter = null,
+    fractional_manager: ?*c.wp_fractional_scale_manager_v1 = null,
+    viewport: ?*c.wp_viewport = null,
+    fractional_scale: ?*c.wp_fractional_scale_v1 = null,
+    /// Compositor's preferred scale in 120ths (150 = 1.25). 0 until the
+    /// first `preferred_scale`; falls back to `output_scale`.
+    scale_120: u32 = 0,
+    /// Integer scale from wl_output, the pre-fractional-scale fallback.
+    output_scale: i32 = 1,
+    /// Buffer dimensions actually rendered. Equal to width/height when no
+    /// scaling applies.
+    buffer_width: u31 = 0,
+    buffer_height: u31 = 0,
+    /// Set when the effective scale changed, so the caller can re-init
+    /// effects that captured their dimensions at construction.
+    scale_changed: bool = false,
+
     /// Output the layer surface is pinned to, copied inline. Empty = let the
     /// compositor choose. Must survive `reconnect`, so it is carried through
     /// the struct literal in `connect` rather than defaulted.
@@ -61,6 +88,41 @@ pub const WaylandState = struct {
 
     pub fn targetName(self: *const WaylandState) []const u8 {
         return self.target_name[0..self.target_len];
+    }
+
+    /// Logical-to-buffer pixel ratio currently in force.
+    pub fn scale(self: *const WaylandState) f32 {
+        if (self.scale_120 != 0) return @as(f32, @floatFromInt(self.scale_120)) / 120.0;
+        return @floatFromInt(self.output_scale);
+    }
+
+    /// Recompute the buffer size from the configured logical size and the
+    /// effective scale, resizing the EGL window and the viewport to match.
+    /// Idempotent; sets `scale_changed` when the buffer dimensions moved.
+    fn applyScale(self: *WaylandState) void {
+        if (self.width == 0 or self.height == 0) return;
+
+        const s = self.scale();
+        const bw: u31 = @intFromFloat(@round(@as(f32, @floatFromInt(self.width)) * s));
+        const bh: u31 = @intFromFloat(@round(@as(f32, @floatFromInt(self.height)) * s));
+        if (bw == self.buffer_width and bh == self.buffer_height) return;
+
+        self.buffer_width = bw;
+        self.buffer_height = bh;
+        self.scale_changed = true;
+
+        if (self.egl_window) |win| c.wl_egl_window_resize(win, bw, bh, 0, 0);
+
+        if (self.viewport) |vp| {
+            // Map the (possibly larger) buffer back onto the surface's logical
+            // extent. Without this the compositor would treat the buffer as
+            // 1:1 and the surface would overhang the output.
+            c.wp_viewport_set_destination(vp, self.width, self.height);
+        } else if (self.scale_120 == 0 and self.output_scale > 1) {
+            // No viewporter: integer buffer scale is the only lever, and it
+            // only expresses whole numbers.
+            c.wl_surface_set_buffer_scale(self.surface, self.output_scale);
+        }
     }
 
     /// Connect, bind globals, and learn every output's name. Shared by `init`
@@ -158,6 +220,17 @@ pub const WaylandState = struct {
         if (c.zwlr_layer_surface_v1_add_listener(self.layer_surface, &layer_surface_listener, self) != 0)
             return error.LayerSurfaceListenerFailed;
 
+        // Ask for the compositor's preferred scale and get a viewport to map
+        // the scaled buffer back onto the surface's logical size. Both are
+        // optional: without them the surface renders at logical resolution,
+        // which is what it always did.
+        if (self.viewporter) |vp_mgr| self.viewport = c.wp_viewporter_get_viewport(vp_mgr, self.surface);
+        if (self.fractional_manager) |fs_mgr| {
+            self.fractional_scale = c.wp_fractional_scale_manager_v1_get_fractional_scale(fs_mgr, self.surface);
+            if (self.fractional_scale) |fs|
+                _ = c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+        }
+
         // Initial commit to trigger configure
         c.wl_surface_commit(self.surface);
 
@@ -168,12 +241,20 @@ pub const WaylandState = struct {
     pub fn createEglWindow(self: *WaylandState) !void {
         if (self.width == 0 or self.height == 0) return error.NotConfigured;
 
+        // Buffer dimensions, not logical ones: everything downstream —
+        // glViewport, iResolution, the coordinate transform — works in buffer
+        // pixels so there is exactly one unit in play.
+        if (self.buffer_width == 0 or self.buffer_height == 0) self.applyScale();
+        const bw = if (self.buffer_width != 0) self.buffer_width else self.width;
+        const bh = if (self.buffer_height != 0) self.buffer_height else self.height;
+
         if (self.egl_window) |win| {
-            c.wl_egl_window_resize(win, self.width, self.height, 0, 0);
+            c.wl_egl_window_resize(win, bw, bh, 0, 0);
         } else {
-            self.egl_window = c.wl_egl_window_create(self.surface, self.width, self.height) orelse
+            self.egl_window = c.wl_egl_window_create(self.surface, bw, bh) orelse
                 return error.EglWindowCreateFailed;
         }
+        if (self.viewport) |vp| c.wp_viewport_set_destination(vp, self.width, self.height);
     }
 
     pub fn requestFrame(self: *WaylandState) !void {
@@ -192,6 +273,8 @@ pub const WaylandState = struct {
     /// is live. Caller must recreate EGL state and re-upload GL resources since the
     /// EGL display was bound to the previous wl_display pointer.
     pub fn reconnect(self: *WaylandState) !void {
+        if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
+        if (self.viewport) |vp| c.wp_viewport_destroy(vp);
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
@@ -214,6 +297,8 @@ pub const WaylandState = struct {
     }
 
     pub fn deinit(self: *WaylandState) void {
+        if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
+        if (self.viewport) |vp| c.wp_viewport_destroy(vp);
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
@@ -249,6 +334,10 @@ fn registryGlobal(
         state.compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 4)));
     } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
         state.layer_shell = @ptrCast(c.wl_registry_bind(registry, name, &c.zwlr_layer_shell_v1_interface, @min(version, 1)));
+    } else if (std.mem.eql(u8, iface, "wp_viewporter")) {
+        state.viewporter = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_viewporter_interface, 1));
+    } else if (std.mem.eql(u8, iface, "wp_fractional_scale_manager_v1")) {
+        state.fractional_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_fractional_scale_manager_v1_interface, 1));
     } else if (std.mem.eql(u8, iface, "wl_output")) {
         // The connector name (DP-1, HDMI-A-1) only exists from v4. Below that
         // there is nothing to match --output against.
@@ -296,8 +385,31 @@ fn registryGlobalRemove(data: ?*anyopaque, _: ?*c.wl_registry, name: u32) callco
 fn outputGeometry(_: ?*anyopaque, _: ?*c.wl_output, _: i32, _: i32, _: i32, _: i32, _: i32, _: [*c]const u8, _: [*c]const u8, _: i32) callconv(.c) void {}
 fn outputMode(_: ?*anyopaque, _: ?*c.wl_output, _: u32, _: i32, _: i32, _: i32) callconv(.c) void {}
 fn outputDone(_: ?*anyopaque, _: ?*c.wl_output) callconv(.c) void {}
-fn outputScale(_: ?*anyopaque, _: ?*c.wl_output, _: i32) callconv(.c) void {}
 fn outputDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
+
+/// Integer output scale — the fallback when the compositor has no
+/// fractional-scale protocol. Only our target output's scale is of interest.
+fn outputScale(data: ?*anyopaque, output: ?*c.wl_output, s: i32) callconv(.c) void {
+    const state: *WaylandState = @ptrCast(@alignCast(data));
+    const proxy = output orelse return;
+    if (state.targetOutput()) |target| {
+        if (target != proxy) return;
+    }
+    if (s > 0) state.output_scale = s;
+}
+
+// --- Fractional scale listener ---
+
+fn fractionalPreferredScale(data: ?*anyopaque, _: ?*c.wp_fractional_scale_v1, scale_120: u32) callconv(.c) void {
+    const state: *WaylandState = @ptrCast(@alignCast(data));
+    if (scale_120 == 0) return;
+    state.scale_120 = scale_120;
+    state.applyScale();
+}
+
+const fractional_scale_listener = c.wp_fractional_scale_v1_listener{
+    .preferred_scale = fractionalPreferredScale,
+};
 
 fn outputName(data: ?*anyopaque, output: ?*c.wl_output, name: [*c]const u8) callconv(.c) void {
     const state: *WaylandState = @ptrCast(@alignCast(data));
@@ -337,15 +449,16 @@ fn layerSurfaceConfigure(
 ) callconv(.c) void {
     const state: *WaylandState = @ptrCast(@alignCast(data));
 
+    // Logical pixels. The buffer we render is `logical * scale`; applyScale
+    // derives it and resizes the EGL window and viewport to match.
     const new_w: u31 = @intCast(width);
     const new_h: u31 = @intCast(height);
-    if (state.configured and (new_w != state.width or new_h != state.height)) {
-        if (state.egl_window) |win| c.wl_egl_window_resize(win, new_w, new_h, 0, 0);
-        state.resize_pending = true;
-    }
+    const changed = state.configured and (new_w != state.width or new_h != state.height);
     state.width = new_w;
     state.height = new_h;
     state.configured = true;
+    state.applyScale();
+    if (changed) state.resize_pending = true;
 
     c.zwlr_layer_surface_v1_ack_configure(surface, serial);
 }

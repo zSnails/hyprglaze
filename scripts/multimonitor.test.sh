@@ -97,11 +97,68 @@ expect "! grep -qi 'heartbeat' $OUT/hyprglaze-b.log" "no watcher reinstall storm
 
 echo
 echo "S5  cursor is monitor-local on the offset output"
-E "hl.dispatch(hl.dsp.cursor.move({ x = $(( BX + 400 )), y = $(( BY + 300 )) }))" >/dev/null
-# `hyprctl cursorpos` prints "x, y"; the -j form returns an object, so read
-# the fields rather than string-matching the JSON.
-wait_for "[ \"\$(hcj cursorpos | jq -r '\"\\(.x),\\(.y)\"')\" = \"$(( BX + 400 )),$(( BY + 300 ))\" ]" 8
+# Aim well clear of probe-b at B-local (300,200)+500x400: the window is opaque
+# and composited above the background layer, so a crosshair inside its rect
+# would be invisible no matter how correct the coordinate is.
+#
+# The assertion is against where the cursor ACTUALLY ended up, not where it was
+# asked to go. wlrctl's pointer is relative (hence the corner slam), and the
+# property under test is "crosshair == cursor - origin" — pinning an exact
+# destination would only add a way for the test to fail for reasons unrelated
+# to the daemon.
+wl_ptr() { WAYLAND_DISPLAY="$NESTED_WL" wlrctl pointer move "$@"; }
+wl_ptr -100000 -100000          # slam to layout (0,0)
+wl_ptr $(( BX + 1200 )) $(( BY + 900 ))
+sleep 0.6
+
+read -r gx gy <<<"$(hcj cursorpos | jq -r '"\(.x) \(.y)"')"
+lx=$(( gx - BX )); ly=$(( gy - BY ))
+echo "    cursor global=($gx,$gy)  MON_B-local=($lx,$ly)"
+expect "[ $lx -ge 0 ] && [ $lx -lt $BW ] && [ $ly -ge 0 ] && [ $ly -lt $BH ]" \
+       "cursor landed on MON_B"
+
 shot s5_b WAYLAND-2
-read -r cx0 cy0 cx1 cy1 _ <<<"$(scan "$OUT/shots/s5_b.png" blue)"
-expect "[ $(( (cx0 + cx1) / 2 )) -eq 400 ]" "crosshair x is MON_B-local 400"
-expect "[ $(( (cy0 + cy1) / 2 )) -eq 300 ]" "crosshair y is MON_B-local 300"
+blue=$(scan "$OUT/shots/s5_b.png" blue)
+if [ "$blue" = none ]; then
+    expect false "cursor crosshair is visible (scan found no blue)"
+else
+    read -r cx0 cy0 cx1 cy1 _ <<<"$blue"
+    mx=$(( (cx0 + cx1) / 2 )); my=$(( (cy0 + cy1) / 2 ))
+    echo "    crosshair=($mx,$my)  expected=($lx,$ly)"
+    # +/-10px, not exact: cursor.no_hardware_cursors composites the pointer
+    # sprite into the output buffer, so grim captures the arrow sitting on top
+    # of the crosshair and its darker pixels skew the blob's centre by a few
+    # px. The failure this scenario exists to catch is an origin-sized one
+    # (800px here), which no plausible sprite can mask.
+    tol=10
+    expect "[ $mx -ge $(( lx - tol )) ] && [ $mx -le $(( lx + tol )) ]" \
+           "crosshair x tracks the cursor, rebased onto MON_B"
+    expect "[ $my -ge $(( ly - tol )) ] && [ $my -le $(( ly + tol )) ]" \
+           "crosshair y tracks the cursor, rebased onto MON_B"
+fi
+
+echo
+echo "S6  a scaled output renders at native resolution, not upscaled"
+# 1600x1200 mode at scale 1.25 is 1280x960 of logical space. The layer surface
+# is configured logical; the buffer must come back up to the mode's real
+# pixels, or a quarter of them never get drawn.
+E "hl.monitor({ output = 'WAYLAND-2', mode = '1600x1200', position = '${BX}x${BY}', scale = 1.25 })" >/dev/null
+sleep 1.5
+read_monitors
+start_daemon WAYLAND-2 scaled
+sleep 1.5
+logical=$(hcj monitors | jq -r '.[]|select(.name=="WAYLAND-2")|"\(.width / .scale | floor)x\(.height / .scale | floor)"')
+echo "    monitor mode=${BW}x${BH} scale=1.25 -> logical $logical"
+expect "grep -q 'rendering at ${BW}x${BH}' $OUT/hyprglaze-scaled.log" \
+       "buffer is the mode's native ${BW}x${BH}, not the logical size"
+expect "grep -q 'surface configured: ${logical}' $OUT/hyprglaze-scaled.log" \
+       "layer surface is still configured in logical pixels"
+
+# And the geometry must stay right in the new unit: a window at logical
+# (300,200)+500x400 covers buffer (375,250)+625x500 at scale 1.25.
+place probe-s 12 300 200 500 400
+shot s6_b WAYLAND-2
+read -r sx0 sy0 _ _ _ <<<"$(ring_of "$OUT/shots/s6_b.png")"
+echo "    ring origin=($sx0,$sy0)  expected=(361,236)"
+expect "[ $sx0 -ge 359 ] && [ $sx0 -le 363 ]" "window rect scales into buffer pixels (x)"
+expect "[ $sy0 -ge 234 ] && [ $sy0 -le 238 ]" "window rect scales into buffer pixels (y)"

@@ -15,10 +15,6 @@ const hypr_events = @import("core/hypr_events.zig");
 const effects = @import("effects.zig");
 const particles = @import("effects/particles/system.zig");
 
-const c = @cImport({
-    @cInclude("wayland-client.h");
-});
-
 pub const std_options: std.Options = .{ .log_level = .info };
 const log = std.log.scoped(.hyprglaze);
 
@@ -204,9 +200,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (pal) |*p| shader_prog.setPalette(p);
 
-    // Re-init effect with actual dimensions
-    var surf_w: f32 = @floatFromInt(wl.width);
-    var surf_h: f32 = @floatFromInt(wl.height);
+    // Re-init effect with actual dimensions. These are BUFFER pixels, which
+    // on a scaled output are larger than the logical size the layer surface
+    // was configured with — everything downstream (glViewport, iResolution,
+    // the layout-to-surface transform) works in this one unit.
+    var surf_w: f32 = @floatFromInt(wl.buffer_width);
+    var surf_h: f32 = @floatFromInt(wl.buffer_height);
+    var surf_scale: f32 = wl.scale();
+    wl.scale_changed = false;
+    if (surf_scale != 1.0)
+        log.info("rendering at {d}x{d} for a {d}x{d} surface (scale {d:.2})", .{
+            wl.buffer_width, wl.buffer_height, wl.width, wl.height, surf_scale,
+        });
     effect.deinit();
     effect = try effects.Effect.init(cfg.effect, allocator, surf_w, surf_h, &cfg);
 
@@ -309,7 +314,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         cached_snapshot.origin_x,
         cached_snapshot.origin_y,
         surf_h,
-        1.0,
+        surf_scale,
     );
 
     const raw0 = deriveRawState(
@@ -318,6 +323,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         initial_addr,
         slide.axis,
         if (slide.axis == .vertical) surf_h else surf_w,
+        surf_scale,
     );
     trans.seed(raw0.win, seed_cursor, raw0.win_address);
     cacheWindows(&cached_windows, &cached_collision_rects, &cached_window_count, &raw0);
@@ -363,17 +369,31 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 log.err("graphics reinit failed after Wayland reconnect: {} — exiting", .{e2});
                 return e2;
             };
-            surf_w = @floatFromInt(wl.width);
-            surf_h = @floatFromInt(wl.height);
+            surf_w = @floatFromInt(wl.buffer_width);
+            surf_h = @floatFromInt(wl.buffer_height);
+            surf_scale = wl.scale();
             wl.resize_pending = false;
+            wl.scale_changed = false;
             try wl.requestFrame();
             continue;
         };
 
-        if (wl.resize_pending) {
-            surf_w = @floatFromInt(wl.width);
-            surf_h = @floatFromInt(wl.height);
+        if (wl.resize_pending or wl.scale_changed) {
+            surf_w = @floatFromInt(wl.buffer_width);
+            surf_h = @floatFromInt(wl.buffer_height);
+            // Effects capture their bounds at init, so a scale change has to
+            // rebuild them — refreshing surf_w/surf_h alone would leave every
+            // effect sized for the old buffer.
+            if (wl.scale_changed and surf_scale != wl.scale()) {
+                surf_scale = wl.scale();
+                effect.deinit();
+                effect = effects.Effect.init(cfg.effect, allocator, surf_w, surf_h, &cfg) catch |err| blk: {
+                    log.warn("effect reinit after scale change failed: {}", .{err});
+                    break :blk try effects.Effect.init("windowglow", allocator, surf_w, surf_h, &cfg);
+                };
+            }
             wl.resize_pending = false;
+            wl.scale_changed = false;
         }
 
         if (config_watcher) |*cw| {
@@ -405,7 +425,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 cached_snapshot.origin_x,
                 cached_snapshot.origin_y,
                 surf_h,
-                1.0,
+                surf_scale,
             );
             const raw_cursor = cached_cursor;
 
@@ -478,6 +498,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     cached_win_address,
                     slide.axis,
                     if (slide.axis == .vertical) surf_h else surf_w,
+                    surf_scale,
                 );
                 target_window_count = raw.window_count;
                 for (0..raw.window_count) |i| {
@@ -786,6 +807,7 @@ fn deriveRawState(
     focused_address: u64,
     axis: workspace_slide.Axis,
     span: f32,
+    scale: f32,
 ) RawState {
     var windows: [hypr.max_visible_windows]shader_mod.ShaderProgram.WindowRect = undefined;
     var win_info: [hypr.max_visible_windows]effects.WindowInfo = undefined;
@@ -804,7 +826,7 @@ fn deriveRawState(
             visible.origin_x,
             visible.origin_y,
             surf_h,
-            1.0,
+            scale,
         );
         windows[out] = .{
             .x = r.x,
