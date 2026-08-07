@@ -121,7 +121,7 @@ pub const WaylandState = struct {
         } else if (self.scale_120 == 0 and self.output_scale > 1) {
             // No viewporter: integer buffer scale is the only lever, and it
             // only expresses whole numbers.
-            c.wl_surface_set_buffer_scale(self.surface, self.output_scale);
+            if (self.surface) |surf| c.wl_surface_set_buffer_scale(surf, self.output_scale);
         }
     }
 

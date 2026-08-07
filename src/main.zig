@@ -277,6 +277,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // monitor's is dropped. Seed the origin from the startup query so the
     // first frames are already rebased; from the first watcher event on, the
     // origin arrives with the geometry it describes.
+    if (mon.name_len == 0) {
+        // Without a name there is nothing to filter the shared watcher's
+        // per-monitor events by, so this daemon would follow whichever
+        // monitor emitted last — the very bug the filter exists to prevent.
+        log.err("Hyprland reported a monitor with no name; cannot scope to an output", .{});
+        return error.BadMonitorReply;
+    }
     events.setMonitor(mon.outputName());
     events.snapshot.origin_x = mon.x;
     events.snapshot.origin_y = mon.y;
