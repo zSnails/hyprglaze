@@ -15,7 +15,7 @@ const log = std.log.scoped(.hypr_events);
 ///   hg:geo:<wsid>\x1d<records>
 ///                    workspace id + visible-window snapshot — stored
 ///                    under mutex, generation counter bumped
-///   hg:hb            watcher heartbeat (~2s) — timestamp stored so the
+///   hg:hb2           watcher heartbeat (~2s) — timestamp stored so the
 ///                    main loop can detect a dead watcher and reinstall
 pub const HyprEvents = struct {
     socket_path: [256]u8,
@@ -46,7 +46,7 @@ pub const HyprEvents = struct {
     snapshot: hypr.VisibleWindows = .{},
     snapshot_gen: std.atomic.Value(u64) = .init(0),
 
-    /// Millisecond timestamp of the last `hg:hb` heartbeat. Seeded by
+    /// Millisecond timestamp of the last `hg:hb2` heartbeat. Seeded by
     /// `noteHeartbeat` when the watcher is (re)installed so a fresh
     /// install isn't immediately flagged as dead.
     last_hb_ms: std.atomic.Value(i64) = .init(0),
@@ -762,6 +762,21 @@ test "handleLine hg:mgeo truncated headers do not bump the generation" {
     try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
     try std.testing.expectEqual(@as(i32, 10), snap.origin_x);
     try std.testing.expectEqual(@as(i32, 20), snap.origin_y);
+}
+
+test "handleLine hg:mgeo unparsable origin fields degrade to zero" {
+    // The watcher formats the origin with %.0f, which renders nan or inf for a
+    // position Hyprland reports as non-finite. Letting that through would
+    // rebase every window rect against junk, so the parse must fall back to 0
+    // rather than to whatever parseInt left behind.
+    var ev = scopedEvents("DP-1");
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1d3\x1dnan\x1dinf\x1d");
+    try std.testing.expectEqual(@as(u64, 1), ev.snapshotGen());
+    var snap: hypr.VisibleWindows = undefined;
+    ev.copySnapshot(&snap);
+    try std.testing.expectEqual(@as(i32, 0), snap.origin_x);
+    try std.testing.expectEqual(@as(i32, 0), snap.origin_y);
+    try std.testing.expectEqual(@as(i64, 3), snap.workspace_id);
 }
 
 test "handleLine legacy hg:geo while scoped triggers a reinstall instead of mixing monitors" {

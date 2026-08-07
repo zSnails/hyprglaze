@@ -22,7 +22,10 @@
 --                               origin ride with the geometry so workspace
 --                               identity, monitor position and window set
 --                               can never tear apart.
---   hg:hb                       heartbeat, every 128 ticks (~2s)
+--   hg:hb2                      heartbeat, every 128 ticks (~2s). Renamed from
+--                               hg:hb so a pre-per-monitor daemon, which
+--                               ignores hg:mgeo, is not kept alive by a
+--                               heartbeat it can no longer act on
 --
 -- One watcher serves every daemon: each filters for its own monitor, so
 -- there is a single 16ms timer no matter how many instances run. Emitting
@@ -82,9 +85,12 @@ __hyprglaze.t = hl.timer(function()
     end
     if #mons == 0 then
         -- Nothing usable. Still tick the heartbeat: going silent here is what
-        -- makes the daemon reinstall this same chunk every 3s forever.
+        -- makes the daemon reinstall this same chunk every 3s forever. It must
+        -- be hg:hb2, the name this protocol's daemon actually accepts — a bare
+        -- hg:hb is ignored and produces exactly the storm this branch exists
+        -- to avoid.
         ticks = ticks + 1
-        if ticks % 128 == 0 then hl.dispatch(hl.dsp.event("hg:hb")) end
+        if ticks % 128 == 0 then hl.dispatch(hl.dsp.event("hg:hb2")) end
         return
     end
 
@@ -102,13 +108,14 @@ __hyprglaze.t = hl.timer(function()
     local midx, active, special = {}, {}, {}
     for mi, m in ipairs(mons) do
         midx[m.id] = mi
-        -- Read the monitor's own fields rather than hl.get_active_workspace(m):
-        -- that function returns the SPECIAL workspace while one is open, so
-        -- using it silently loses the regular workspace — and with it every
-        -- normal window — for as long as a scratchpad is up. The monitor
-        -- object keeps the two apart, which is the distinction that matters
-        -- here. (Hyprland's own IPC agrees: activeWorkspace stays 11 while
-        -- specialWorkspace reads -99.)
+        -- Read the monitor's own fields, which name the regular and the
+        -- special workspace separately, rather than inferring one from a call
+        -- that could in principle return either. Measured on 0.56.1
+        -- (scripts/scratchpad.probe.sh): with a scratchpad open,
+        -- m.active_workspace and hl.get_active_workspace(m) BOTH still return
+        -- the regular workspace, and the windows under it keep visible=true.
+        -- So this is not working around a quirk; it is refusing to depend on
+        -- one call to disambiguate two things.
         local aw = m.active_workspace
         if aw == nil then aw = hl.get_active_workspace and hl.get_active_workspace(m) end
         local aid = (type(aw) == "number" and aw) or (aw and aw.id) or 0

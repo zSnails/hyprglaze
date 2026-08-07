@@ -124,9 +124,13 @@ pub const WaylandState = struct {
             // extent. Without this the compositor would treat the buffer as
             // 1:1 and the surface would overhang the output.
             c.wp_viewport_set_destination(vp, self.width, self.height);
-        } else if (self.scale_120 == 0 and self.output_scale > 1) {
+        } else if (self.scale_120 == 0) {
             // No viewporter: integer buffer scale is the only lever, and it
-            // only expresses whole numbers.
+            // only expresses whole numbers. Set unconditionally rather than
+            // only when > 1 — dropping a monitor from scale 2 back to 1 would
+            // otherwise resize the buffer while the surface still declared 2x,
+            // leaving the wallpaper on a quarter of the screen or tripping a
+            // size protocol error.
             if (self.surface) |surf| c.wl_surface_set_buffer_scale(surf, self.output_scale);
         }
     }
@@ -308,21 +312,28 @@ pub const WaylandState = struct {
     /// `reconnect`'s first step and as `deinit` — `reconnect` can fail
     /// anywhere in `connect`, after which main's `defer deinit` still runs.
     fn teardown(self: *WaylandState) void {
-        if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
-        if (self.viewport) |vp| c.wp_viewport_destroy(vp);
-        if (self.egl_window) |win| c.wl_egl_window_destroy(win);
-        if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
-        if (self.surface) |s| c.wl_surface_destroy(s);
-        // Release the output proxies before the display goes: they belong to
-        // the connection being torn down, and `connect` rebuilds the table
-        // from the new registry.
-        self.releaseOutputs();
-        // Only when we still own them. After a failed `connect` the errdefers
-        // in there have already freed the display and registry.
+        // EVERY destroy below marshals a request through the display, so all
+        // of them belong inside this guard, not just the display and registry
+        // themselves. After a failed `connect` its errdefers have already run
+        // `wl_display_disconnect`, and touching any proxy that was bound on
+        // that display — the wl_outputs from the first roundtrip, in
+        // particular — dereferences freed memory.
         if (self.connected) {
+            if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
+            if (self.viewport) |vp| c.wp_viewport_destroy(vp);
+            if (self.egl_window) |win| c.wl_egl_window_destroy(win);
+            if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
+            if (self.surface) |s| c.wl_surface_destroy(s);
+            // Before the display goes: they belong to the connection being
+            // torn down, and `connect` rebuilds the table from the new
+            // registry.
+            self.releaseOutputs();
             c.wl_registry_destroy(self.registry);
             c.wl_display_disconnect(self.display);
         }
+        // Whether or not we destroyed them, drop every reference: the fields
+        // must not survive as dangling pointers for a second teardown.
+        self.output_count = 0;
 
         self.fractional_scale = null;
         self.viewport = null;
@@ -459,6 +470,13 @@ fn outputName(data: ?*anyopaque, output: ?*c.wl_output, name: [*c]const u8) call
         if (e.proxy != proxy) continue;
         e.name_len = @intCast(@min(s.len, max_output_name));
         @memcpy(e.name[0..e.name_len], s[0..e.name_len]);
+        // Our output came back. A mode or monitor-rule change destroys and
+        // re-creates the global, often inside one dispatch batch, and without
+        // clearing the flag here the daemon would exit reporting a monitor
+        // that is present and healthy. Cleared on the name rather than on the
+        // bind, so an unrelated output appearing cannot mask a real loss.
+        if (state.target_len != 0 and std.mem.eql(u8, e.outputName(), state.targetName()))
+            state.target_gone = false;
         return;
     }
 }

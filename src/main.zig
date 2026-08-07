@@ -212,8 +212,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.info("rendering at {d}x{d} for a {d}x{d} surface (scale {d:.2})", .{
             wl.buffer_width, wl.buffer_height, wl.width, wl.height, surf_scale,
         });
-    effect.deinit();
-    effect = try effects.Effect.init(cfg.effect, allocator, surf_w, surf_h, &cfg);
+    // Via rebuildEffect rather than deinit-then-init: on a large output this
+    // is the first allocation at real size and can fail, and the naive order
+    // would leave `effect` holding a deinited union for the `defer` above to
+    // free a second time. Effect.deinit has no idempotence guard.
+    _ = rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h);
 
     log.info("entering render loop", .{});
 
@@ -362,21 +365,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     drawFrame(&shader_prog, &egl_state, surf_w, surf_h, 0.0, &trans, &cached_windows, cached_window_count);
     egl_state.swapBuffers() catch |err| log.warn("initial swapBuffers error: {}", .{err});
 
-    // Main loop
-    // Set when the pinned output disappears, so the exit can be reported as a
-    // failure rather than a clean shutdown — see the return at the end.
-    var lost_output = false;
+    // Bounded retries for a failed effect resize; see the resize block.
+    var resize_retries: u8 = 0;
 
+    // Main loop
     while (!wl.should_close and !should_exit.load(.acquire)) {
-        // Checked here rather than inside the frame-done block below: losing
-        // the output also closes the layer surface and stops frame callbacks,
-        // so `frame_done` never comes true again and anything nested under it
-        // is unreachable on exactly the path it exists to explain.
-        if (wl.target_gone) {
-            log.err("output '{s}' was removed", .{wl.targetName()});
-            lost_output = true;
-            break;
-        }
         wl.dispatch() catch |err| {
             if (should_exit.load(.acquire)) break;
             log.warn("Wayland dispatch error: {} — reconnecting in 1s", .{err});
@@ -385,7 +378,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 log.err("Wayland reconnect failed: {} — exiting", .{e2});
                 return e2;
             };
-            recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &pal, &wl, shader_path_expanded) catch |e2| {
+            recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &cfg, &pal, &wl, shader_path_expanded) catch |e2| {
                 log.err("graphics reinit failed after Wayland reconnect: {} — exiting", .{e2});
                 return e2;
             };
@@ -410,7 +403,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
             surf_w = new_w;
             surf_h = new_h;
             surf_scale = wl.scale();
-            if (dims_changed) rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h);
+            if (dims_changed and !rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h)) {
+                // A transient failure (an FBO allocation losing a race with
+                // something else on the GPU) would otherwise strand the effect
+                // at the old size for the life of the process, since nothing
+                // re-raises the flag. Retry on the next frames, bounded so a
+                // permanent failure does not spin.
+                if (resize_retries < 3) {
+                    resize_retries += 1;
+                    continue;
+                }
+                log.err("effect stuck at the old size after {d} attempts", .{resize_retries});
+            }
+            resize_retries = 0;
             wl.resize_pending = false;
             wl.scale_changed = false;
         }
@@ -639,7 +644,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             egl_state.swapBuffers() catch |err| {
                 if (err == error.EglContextLost) {
                     log.warn("EGL context lost — reinitialising graphics", .{});
-                    try recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &pal, &wl, shader_path_expanded);
+                    try recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &cfg, &pal, &wl, shader_path_expanded);
                 } else {
                     log.warn("eglSwapBuffers error: {}", .{err});
                 }
@@ -657,17 +662,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
-    // Losing the pinned output is a failure, not a clean shutdown. Returning
-    // void here would exit 0, and `hyprglaze@.service`'s Restart=on-failure
-    // ignores that — the wallpaper would stay dead after the monitor came
-    // back, which for a one-instance-per-monitor design is the routine case.
-    if (lost_output) return error.OutputRemoved;
+    // Asked here rather than inside the loop, because losing an output sets
+    // `target_gone` and closes the layer surface in the same dispatch: any
+    // in-loop check races the `should_close` condition and loses. After the
+    // loop it does not matter which flag ended it.
+    //
+    // A clean exit would be exit 0, which `Restart=on-failure` ignores — and
+    // for one instance per monitor, a monitor going away and coming back is
+    // the routine case rather than an exceptional one.
+    if (wl.target_gone) {
+        log.err("output '{s}' was removed", .{wl.targetName()});
+        return error.OutputRemoved;
+    }
 }
 
-/// Tear down and rebuild the GL pipeline: EGL state, shader program, and
-/// re-upload the effect's uniforms. Used after a Wayland reconnect or an
-/// `EglContextLost`. The palette pointer is re-bound if present. Caller is
-/// responsible for any post-reinit work (surface dimensions, requestFrame).
 /// Re-init the active effect at new dimensions, in place.
 ///
 /// Never leaves `effect` holding a deinited value: the old context is only
@@ -675,27 +683,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
 /// double-deinit through main's `defer effect.deinit()`. On failure the
 /// existing effect keeps running at the old size, which is wrong but visible,
 /// rather than taking the wallpaper down.
+///
+/// The replacement is built from the LIVE union tag, not from `cfg.effect`:
+/// a `reloadConfig` that swapped the effect and then bailed before committing
+/// the config leaves those two disagreeing, and resolving by name would
+/// silently swap the running effect for a different one on the next resize.
 fn rebuildEffect(
     allocator: std.mem.Allocator,
     effect: *effects.Effect,
     cfg: *const config_mod.Config,
     w: f32,
     h: f32,
-) void {
-    var fresh = effects.Effect.init(cfg.effect, allocator, w, h, cfg) catch |err| {
+) bool {
+    const fresh = effects.Effect.init(effect.cliNameOf(), allocator, w, h, cfg) catch |err| {
         log.warn("effect resize to {d}x{d} failed: {} — keeping the old size", .{ w, h, err });
-        return;
+        return false;
     };
     effect.deinit();
     effect.* = fresh;
-    fresh = undefined;
+    return true;
 }
 
+/// Tear down and rebuild the GL pipeline: EGL state, shader program, and the
+/// effect. Used after a Wayland reconnect or an `EglContextLost`. The palette
+/// pointer is re-bound if present. Caller is responsible for any post-reinit
+/// work (surface dimensions, requestFrame).
 fn recreateGraphics(
     allocator: std.mem.Allocator,
     egl_state: *egl_mod.EglState,
     shader_prog: *shader_mod.ShaderProgram,
     effect: *effects.Effect,
+    cfg: *const config_mod.Config,
     pal: *?palette_mod.Palette,
     wl: *const wayland.WaylandState,
     shader_path_expanded: []const u8,
@@ -707,6 +725,11 @@ fn recreateGraphics(
     defer allocator.free(new_frag);
     shader_prog.* = try shader_mod.ShaderProgram.init(new_frag);
     if (pal.*) |*p| shader_prog.setPalette(p);
+    // eglDestroyContext above invalidated every GL name, including the ones
+    // effects own themselves — milkdrop's FBO and textures, swarm's program.
+    // Re-uploading uniforms is not enough; those objects have to be rebuilt or
+    // the effect draws nothing until the daemon is restarted.
+    _ = rebuildEffect(allocator, effect, cfg, @floatFromInt(wl.buffer_width), @floatFromInt(wl.buffer_height));
     effect.upload(shader_prog);
 }
 

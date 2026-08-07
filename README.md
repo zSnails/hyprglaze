@@ -190,10 +190,21 @@ systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
 ```
 
 but it is `WantedBy=graphical-session.target`, which only something like uwsm
-reaches. If Hyprland is started directly — from a display manager or a
-`start-hyprland` script — that target is never activated, so the units run
-once because of `--now` and are gone after the next login. Use the
-`exec_cmd` form there.
+reaches. If Hyprland is started directly, from a display manager or a
+`start-hyprland` script, that target is never activated, so the units run once
+because of `--now` and are gone after the next login. Use the `exec_cmd` form
+there.
+
+One thing the unit buys that `exec_cmd` does not: when a monitor is unplugged,
+the instance pinned to it exits non-zero, and `Restart=on-failure` brings the
+wallpaper back when the monitor returns. Launched bare from `exec_cmd` nothing
+supervises it, so that screen stays empty until you rerun the command. If you
+care about hotplug and cannot reach `graphical-session.target`, wrap the
+launch in a loop:
+
+```lua
+hl.exec_cmd("sh -c 'while :; do hyprglaze --output DP-1; sleep 5; done' &")
+```
 
 Each instance tracks only its own monitor's windows and cursor, and its
 effects see coordinates relative to that monitor. They share a single Lua
