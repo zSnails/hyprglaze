@@ -17,30 +17,30 @@ ring_y1() { echo $(( $1 + $2 + 13 )); }
 
 echo
 echo "S0  monitor origins are logical, not physical"
-# WAYLAND-1 at scale 1.25 makes an 800x600 mode 640x480 logical. An
-# auto-positioned WAYLAND-2 lands at the LOGICAL right edge if x/y are logical.
-E "hl.monitor({ output = 'WAYLAND-1', mode = '800x600', position = '0x0', scale = 1.25 })" >/dev/null
-E "hl.monitor({ output = 'WAYLAND-2', mode = '1600x1200', position = 'auto', scale = 1 })" >/dev/null
+# $MON_A at scale 1.25 makes an 800x600 mode 640x480 logical. An
+# auto-positioned $MON_B lands at the LOGICAL right edge if x/y are logical.
+E "hl.monitor({ output = '$MON_A', mode = '800x600', position = '0x0', scale = 1.25 })" >/dev/null
+E "hl.monitor({ output = '$MON_B', mode = '1600x1200', position = 'auto', scale = 1 })" >/dev/null
 sleep 1.2
-probe_x=$(hcj monitors | jq -r '.[]|select(.name=="WAYLAND-2")|.x')
-expect "[ '$probe_x' = '640' ]" "auto-placed WAYLAND-2 sits at logical x=640 (not physical 800)"
+probe_x=$(hcj monitors | jq -r --arg m "$MON_B" '.[]|select(.name==$m)|.x')
+expect "[ '$probe_x' = '640' ]" "auto-placed $MON_B sits at logical x=640 (not physical 800)"
 apply_layout "$LAYOUT"   # restore
 
 echo
 echo "S1  --output pins the layer surface to the named monitor"
-start_daemon WAYLAND-2 b
-on_b=$(hcj layers | jq -r '.["WAYLAND-2"].levels["0"][]?|select(.namespace=="hyprglaze")|.namespace')
-on_a=$(hcj layers | jq -r '.["WAYLAND-1"].levels["0"][]?|select(.namespace=="hyprglaze")|.namespace')
-expect "[ '$on_b' = 'hyprglaze' ]" "hyprglaze layer is on WAYLAND-2"
-expect "[ -z '$on_a' ]"            "no hyprglaze layer on WAYLAND-1"
-shot s1_a WAYLAND-1
+start_daemon $MON_B b
+on_b=$(hcj layers | jq -r --arg m "$MON_B" '.[$m].levels["0"][]?|select(.namespace=="hyprglaze")|.namespace')
+on_a=$(hcj layers | jq -r --arg m "$MON_A" '.[$m].levels["0"][]?|select(.namespace=="hyprglaze")|.namespace')
+expect "[ '$on_b' = 'hyprglaze' ]" "hyprglaze layer is on MON_B"
+expect "[ -z '$on_a' ]"            "no hyprglaze layer on MON_A"
+shot s1_a $MON_A
 # misc.background_color is magenta, so bare output == still magenta.
-expect "[ \"\$(scan $OUT/shots/s1_a.png magenta)\" != none ]" "WAYLAND-1 is bare (sentinel intact)"
+expect "[ \"\$(scan $OUT/shots/s1_a.png magenta)\" != none ]" "$MON_A is bare (sentinel intact)"
 
 echo
 echo "S2  window rects are monitor-local on an offset output"
 place probe-b 11 300 200 500 400
-shot s2_b WAYLAND-2
+shot s2_b $MON_B
 read -r x0 y0 x1 y1 _ <<<"$(ring_of "$OUT/shots/s2_b.png")"
 e_x0=$(ring_x0 300); e_y0=$(ring_y0 200)
 e_x1=$(ring_x1 300 500); e_y1=$(ring_y1 200 400)
@@ -56,13 +56,13 @@ expect "[ $y1 -eq $e_y1 ]" "ring bottom edge tracks window height"
 
 echo
 echo "S3  the tracked window set is pinned, not focus-following"
-shot s3_focus_b WAYLAND-2
+shot s3_focus_b $MON_B
 place probe-a 1 100 100 300 200
-# Focus workspace 1, which the nested config pins to WAYLAND-1. Explicit
+# Focus workspace 1, which the nested config pins to $MON_A. Explicit
 # rather than relying on the placement above having left focus there.
 E "hl.dispatch(hl.dsp.focus({ workspace = 1 }))" >/dev/null
-wait_for "[ \"\$(hcj monitors | jq -r '.[]|select(.focused)|.name')\" = WAYLAND-1 ]" 10
-shot s3_focus_a WAYLAND-2
+wait_for "[ \"\$(hcj monitors | jq -r '.[]|select(.focused)|.name')\" = $MON_A ]" 10
+shot s3_focus_a $MON_B
 # Compare the tracked geometry, not the bytes: the ring legitimately changes
 # colour (red -> green) when focus leaves this monitor, so a byte compare
 # would fail on correct behaviour. What must not change is WHICH window is
@@ -71,25 +71,25 @@ read -r bx0 by0 bx1 by1 _ <<<"$(ring_of "$OUT/shots/s3_focus_b.png")"
 read -r ax0 ay0 ax1 ay1 _ <<<"$(ring_of "$OUT/shots/s3_focus_a.png")"
 echo "    focus on B: ($bx0,$by0)..($bx1,$by1)   focus on A: ($ax0,$ay0)..($ax1,$ay1)"
 expect "[ '$ax0 $ay0 $ax1 $ay1' = '$bx0 $by0 $bx1 $by1' ]" \
-       "WAYLAND-2 keeps tracing its own window when focus moves to WAYLAND-1"
+       "$MON_B keeps tracing its own window when focus moves to $MON_A"
 expect "[ '$ax0' = '$(ring_x0 300)' ]" "...and it is still MON_B's window, not MON_A's"
 
 echo
 echo "S4  two instances, one per monitor, each tracking only its own"
-shot s4_a_solo WAYLAND-1
-start_daemon WAYLAND-1 a
-shot s4_a_dual WAYLAND-1
-shot s4_b_dual WAYLAND-2
+shot s4_a_solo $MON_A
+start_daemon $MON_A a
+shot s4_a_dual $MON_A
+shot s4_b_dual $MON_B
 read -r ax0 ay0 _ _ _ <<<"$(ring_of "$OUT/shots/s4_a_dual.png")"
 read -r bx0 by0 _ _ _ <<<"$(ring_of "$OUT/shots/s4_b_dual.png")"
 # A's window is at A-local (100,100); B's is at B-local (300,200). Assert the
 # window CONTENTS per instance, not just that both render: before per-monitor
 # events both daemons carried the same global set, so a weaker check passed
 # while nothing actually worked.
-expect "[ '$ax0' = '$(ring_x0 100)' ]" "WAYLAND-1 instance tracks its own window"
-expect "[ '$bx0' = '$(ring_x0 300)' ]" "WAYLAND-2 instance tracks its own window"
-expect "[ '$ay0' = '$(ring_y0 100)' ]" "WAYLAND-1 instance y is local too"
-expect "[ '$by0' = '$(ring_y0 200)' ]" "WAYLAND-2 instance y is local too"
+expect "[ '$ax0' = '$(ring_x0 100)' ]" "$MON_A instance tracks its own window"
+expect "[ '$bx0' = '$(ring_x0 300)' ]" "$MON_B instance tracks its own window"
+expect "[ '$ay0' = '$(ring_y0 100)' ]" "$MON_A instance y is local too"
+expect "[ '$by0' = '$(ring_y0 200)' ]" "$MON_B instance y is local too"
 # The second install must not have killed the first daemon's watcher timer.
 sleep 12
 expect "! grep -qi 'heartbeat' $OUT/hyprglaze-a.log" "no watcher reinstall storm on instance A"
@@ -115,7 +115,7 @@ echo "    cursor global=($gx,$gy)  MON_B-local=($lx,$ly)"
 expect "[ $lx -ge 0 ] && [ $lx -lt $BW ] && [ $ly -ge 0 ] && [ $ly -lt $BH ]" \
        "cursor landed on MON_B"
 
-shot s5_b WAYLAND-2
+shot s5_b $MON_B
 blue=$(scan "$OUT/shots/s5_b.png" blue)
 if [ "$blue" = none ]; then
     expect false "cursor crosshair is visible (scan found no blue)"
@@ -140,12 +140,12 @@ echo "S6  a scaled output renders at native resolution, not upscaled"
 # 1600x1200 mode at scale 1.25 is 1280x960 of logical space. The layer surface
 # is configured logical; the buffer must come back up to the mode's real
 # pixels, or a quarter of them never get drawn.
-E "hl.monitor({ output = 'WAYLAND-2', mode = '1600x1200', position = '${BX}x${BY}', scale = 1.25 })" >/dev/null
+E "hl.monitor({ output = '$MON_B', mode = '1600x1200', position = '${BX}x${BY}', scale = 1.25 })" >/dev/null
 sleep 1.5
 read_monitors
-start_daemon WAYLAND-2 scaled
+start_daemon $MON_B scaled
 sleep 1.5
-logical=$(hcj monitors | jq -r '.[]|select(.name=="WAYLAND-2")|"\(.width / .scale | floor)x\(.height / .scale | floor)"')
+logical=$(hcj monitors | jq -r --arg m "$MON_B" '.[]|select(.name==$m)|"\(.width / .scale | floor)x\(.height / .scale | floor)"')
 echo "    monitor mode=${BW}x${BH} scale=1.25 -> logical $logical"
 expect "grep -q 'rendering at ${BW}x${BH}' $OUT/hyprglaze-scaled.log" \
        "buffer is the mode's native ${BW}x${BH}, not the logical size"
@@ -155,8 +155,9 @@ expect "grep -q 'surface configured: ${logical}' $OUT/hyprglaze-scaled.log" \
 # And the geometry must stay right in the new unit: a window at logical
 # (300,200)+500x400 covers buffer (375,250)+625x500 at scale 1.25.
 place probe-s 12 300 200 500 400
-shot s6_b WAYLAND-2
+shot s6_b $MON_B
 read -r sx0 sy0 _ _ _ <<<"$(ring_of "$OUT/shots/s6_b.png")"
 echo "    ring origin=($sx0,$sy0)  expected=(361,236)"
 expect "[ $sx0 -ge 359 ] && [ $sx0 -le 363 ]" "window rect scales into buffer pixels (x)"
 expect "[ $sy0 -ge 234 ] && [ $sy0 -le 238 ]" "window rect scales into buffer pixels (y)"
+

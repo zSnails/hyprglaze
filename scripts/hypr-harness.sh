@@ -15,8 +15,9 @@
 # Sourced test bodies get:
 #   $OUT                     artifacts dir
 #   $NESTED_SIG $NESTED_WL   the nested instance
-#   $AW $AH $AX $AY          MON_A (WAYLAND-1) size and origin, read back
-#   $BW $BH $BX $BY          MON_B (WAYLAND-2) size and origin, read back
+#   $MON_A $MON_B            resolved output names (do not hardcode them)
+#   $AW $AH $AX $AY          MON_A size and origin, read back
+#   $BW $BH $BX $BY          MON_B size and origin, read back
 #   hc/hcj ARGS              hyprctl against the nested instance
 #   E LUA                    hyprctl eval against the nested instance
 #   start_daemon OUT TAG     launch hyprglaze pinned to an output
@@ -153,32 +154,58 @@ hcj() { hyprctl -i "$NESTED_SIG" -j "$@"; }
 E()   { hyprctl -i "$NESTED_SIG" eval "$1"; }
 
 # -------------------------------------------------- second output + layout ---
-hc output create wayland >/dev/null || die "output create wayland failed"
+# A nested wayland output is backed by a host window, so the host's tiling WM
+# can resize it and the requested mode is then silently ignored — every fixed
+# test coordinate falls outside the monitor and gets clipped, which measures
+# like a tracking bug. Float the aquamarine windows in the host config to hold
+# the size, and rely on the mode guard in apply_layout to catch it when they
+# are not. HG_HEADLESS_B=1 uses a headless output instead, whose size the host
+# cannot touch — but Hyprland reported it as 0x0 here, so it is not the
+# default; verify before trusting it.
+if [ "${HG_HEADLESS_B:-0}" = 1 ]; then
+    hc output create headless >/dev/null || die "output create headless failed"
+else
+    hc output create wayland >/dev/null || die "output create wayland failed"
+fi
 for _ in $(seq 1 40); do
     [ "$(hcj monitors | jq length)" = "2" ] && break; sleep 0.25
 done
 [ "$(hcj monitors | jq length)" = "2" ] || die "second output never appeared"
 
+# Names are whatever the backend chose (WAYLAND-2, HEADLESS-2, ...), so no
+# test may hardcode them.
+MON_A=$(hcj monitors | jq -r 'sort_by(.id)|.[0].name')
+MON_B=$(hcj monitors | jq -r 'sort_by(.id)|.[1].name')
+[ -n "$MON_A" ] && [ -n "$MON_B" ] || die "could not resolve monitor names"
+
 read_monitors() {
-    eval "$(hcj monitors | jq -r '
-      (.[]|select(.name=="WAYLAND-1")) as $a | (.[]|select(.name=="WAYLAND-2")) as $b |
-      "AW=\($a.width); AH=\($a.height); AX=\($a.x); AY=\($a.y);
-       BW=\($b.width); BH=\($b.height); BX=\($b.x); BY=\($b.y)"')"
+    eval "$(hcj monitors | jq -r --arg a "$MON_A" --arg b "$MON_B" '
+      (.[]|select(.name==$a)) as $ma | (.[]|select(.name==$b)) as $mb |
+      "AW=\($ma.width); AH=\($ma.height); AX=\($ma.x); AY=\($ma.y);
+       BW=\($mb.width); BH=\($mb.height); BX=\($mb.x); BY=\($mb.y)"')"
 }
 
 apply_layout() {
     case "$1" in
-      x)    a_mode=800x600;  b_mode=1600x1200; b_pos=800x0 ;;
-      y)    a_mode=800x600;  b_mode=1600x1200; b_pos=0x600 ;;
-      side) a_mode=1280x800; b_mode=1280x800;  b_pos=1280x0 ;;
+      x)    a_mode=800x600;  b_mode=1600x1200; b_pos=800x0;  b_w=1600; b_h=1200 ;;
+      y)    a_mode=800x600;  b_mode=1600x1200; b_pos=0x600;  b_w=1600; b_h=1200 ;;
+      side) a_mode=1280x800; b_mode=1280x800;  b_pos=1280x0; b_w=1280; b_h=800 ;;
       *)    die "unknown layout '$1' (want x|y|side)" ;;
     esac
-    E "hl.monitor({ output = 'WAYLAND-1', mode = '$a_mode', position = '0x0', scale = 1 })" >/dev/null
-    E "hl.monitor({ output = 'WAYLAND-2', mode = '$b_mode', position = '$b_pos', scale = 1 })" >/dev/null
+    E "hl.monitor({ output = '$MON_A', mode = '$a_mode', position = '0x0', scale = 1 })" >/dev/null
+    E "hl.monitor({ output = '$MON_B', mode = '$b_mode', position = '$b_pos', scale = 1 })" >/dev/null
     sleep 1
     read_monitors
     # If B's origin came back (0,0) every scenario passes vacuously.
     [ "$BX" -ne 0 ] || [ "$BY" -ne 0 ] || die "MON_B origin is (0,0) — the test would be vacuous"
+    # And if the mode was ignored, every fixed coordinate in the bodies below
+    # lands outside the monitor and gets clipped — measurements that look like
+    # tracking bugs but are not. Fail loudly rather than measure rubbish.
+    if [ "$BW" != "$b_w" ] || [ "$BH" != "$b_h" ]; then
+        die "MON_B is ${BW}x${BH}, not the requested ${b_w}x${b_h} — the backend ignored the mode.
+     A nested wayland output follows its host window; re-run without HG_WAYLAND_B=1
+     to use a headless output whose size the host cannot touch."
+    fi
 }
 apply_layout "$LAYOUT"
 

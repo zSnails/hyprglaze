@@ -363,7 +363,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     egl_state.swapBuffers() catch |err| log.warn("initial swapBuffers error: {}", .{err});
 
     // Main loop
+    // Set when the pinned output disappears, so the exit can be reported as a
+    // failure rather than a clean shutdown — see the return at the end.
+    var lost_output = false;
+
     while (!wl.should_close and !should_exit.load(.acquire)) {
+        // Checked here rather than inside the frame-done block below: losing
+        // the output also closes the layer surface and stops frame callbacks,
+        // so `frame_done` never comes true again and anything nested under it
+        // is unreachable on exactly the path it exists to explain.
+        if (wl.target_gone) {
+            log.err("output '{s}' was removed", .{wl.targetName()});
+            lost_output = true;
+            break;
+        }
         wl.dispatch() catch |err| {
             if (should_exit.load(.acquire)) break;
             log.warn("Wayland dispatch error: {} — reconnecting in 1s", .{err});
@@ -386,19 +399,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         };
 
         if (wl.resize_pending or wl.scale_changed) {
-            surf_w = @floatFromInt(wl.buffer_width);
-            surf_h = @floatFromInt(wl.buffer_height);
-            // Effects capture their bounds at init, so a scale change has to
-            // rebuild them — refreshing surf_w/surf_h alone would leave every
-            // effect sized for the old buffer.
-            if (wl.scale_changed and surf_scale != wl.scale()) {
-                surf_scale = wl.scale();
-                effect.deinit();
-                effect = effects.Effect.init(cfg.effect, allocator, surf_w, surf_h, &cfg) catch |err| blk: {
-                    log.warn("effect reinit after scale change failed: {}", .{err});
-                    break :blk try effects.Effect.init("windowglow", allocator, surf_w, surf_h, &cfg);
-                };
-            }
+            const new_w: f32 = @floatFromInt(wl.buffer_width);
+            const new_h: f32 = @floatFromInt(wl.buffer_height);
+            // Rebuild on any change to the BUFFER size, not just a scale
+            // change. Effects capture their bounds at init — milkdrop sizes
+            // its FBOs, swarm its canvas — so a plain resolution change with
+            // the scale untouched would leave every one of them drawing at
+            // the old dimensions.
+            const dims_changed = new_w != surf_w or new_h != surf_h;
+            surf_w = new_w;
+            surf_h = new_h;
+            surf_scale = wl.scale();
+            if (dims_changed) rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h);
             wl.resize_pending = false;
             wl.scale_changed = false;
         }
@@ -450,10 +462,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 // geometry with the corrected origin within one 16ms tick,
                 // window event or not.
                 log.info("monitor topology changed", .{});
-            }
-            if (wl.target_gone) {
-                log.err("output '{s}' was removed — exiting", .{wl.targetName()});
-                break;
             }
             // Config reload recreates Hyprland's Lua state (killing the
             // watcher); a socket2 reconnect means change-only events may
@@ -648,12 +656,41 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
     }
+
+    // Losing the pinned output is a failure, not a clean shutdown. Returning
+    // void here would exit 0, and `hyprglaze@.service`'s Restart=on-failure
+    // ignores that — the wallpaper would stay dead after the monitor came
+    // back, which for a one-instance-per-monitor design is the routine case.
+    if (lost_output) return error.OutputRemoved;
 }
 
 /// Tear down and rebuild the GL pipeline: EGL state, shader program, and
 /// re-upload the effect's uniforms. Used after a Wayland reconnect or an
 /// `EglContextLost`. The palette pointer is re-bound if present. Caller is
 /// responsible for any post-reinit work (surface dimensions, requestFrame).
+/// Re-init the active effect at new dimensions, in place.
+///
+/// Never leaves `effect` holding a deinited value: the old context is only
+/// released once a replacement exists, so an error here cannot set up a
+/// double-deinit through main's `defer effect.deinit()`. On failure the
+/// existing effect keeps running at the old size, which is wrong but visible,
+/// rather than taking the wallpaper down.
+fn rebuildEffect(
+    allocator: std.mem.Allocator,
+    effect: *effects.Effect,
+    cfg: *const config_mod.Config,
+    w: f32,
+    h: f32,
+) void {
+    var fresh = effects.Effect.init(cfg.effect, allocator, w, h, cfg) catch |err| {
+        log.warn("effect resize to {d}x{d} failed: {} — keeping the old size", .{ w, h, err });
+        return;
+    };
+    effect.deinit();
+    effect.* = fresh;
+    fresh = undefined;
+}
+
 fn recreateGraphics(
     allocator: std.mem.Allocator,
     egl_state: *egl_mod.EglState,

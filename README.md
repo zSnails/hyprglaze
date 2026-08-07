@@ -173,18 +173,27 @@ silent fall back to the wrong screen. Changing it needs a restart — the
 surface is bound to its output when it is created — so a live config reload
 logs a warning instead of pretending to apply.
 
-For a wallpaper on every monitor, run one instance per monitor:
+For a wallpaper on every monitor, run one instance per monitor — from
+`hyprland.lua`:
 
-```
-hyprglaze --output DP-1 &
-hyprglaze --output HDMI-A-1 &
+```lua
+hl.on("hyprland.start", function()
+    hl.exec_cmd("hyprglaze --output DP-1 &")
+    hl.exec_cmd("hyprglaze --output HDMI-A-1 &")
+end)
 ```
 
-or, with the packaged template unit:
+A templated systemd unit is packaged as well:
 
 ```
 systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
 ```
+
+but it is `WantedBy=graphical-session.target`, which only something like uwsm
+reaches. If Hyprland is started directly — from a display manager or a
+`start-hyprland` script — that target is never activated, so the units run
+once because of `--now` and are gone after the next login. Use the
+`exec_cmd` form there.
 
 Each instance tracks only its own monitor's windows and cursor, and its
 effects see coordinates relative to that monitor. They share a single Lua

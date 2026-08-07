@@ -8,6 +8,11 @@ After=graphical-session.target
 #   systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
 # Names come from `hyprctl monitors -j | jq -r '.[].name'`. Do not enable
 # hyprglaze.service alongside this for the same screen — both would render.
+#
+# Requires a session that actually reaches graphical-session.target (uwsm or
+# equivalent). Hyprland started directly never activates it, and these units
+# would then run once from `--now` and never again; launch from hyprland.lua
+# with hl.exec_cmd instead. See the README.
 
 [Service]
 Type=simple

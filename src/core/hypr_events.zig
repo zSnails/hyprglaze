@@ -309,7 +309,12 @@ fn handleCustom(self: *HyprEvents, data: []const u8) void {
         if (self.monitor_name_len != 0 and
             !std.mem.eql(u8, payload[0..gi], self.monitorName())) return;
 
-        const snap = parseGeoM(payload[gi + 1 ..]);
+        // A short header means we could not read the origin. Dropping the
+        // event leaves the previous good snapshot in place; publishing a
+        // zero-initialised one would rebase every window against origin (0,0)
+        // — a whole-screen jump on any monitor that is not at the layout
+        // origin.
+        const snap = parseGeoM(payload[gi + 1 ..]) orelse return;
         lockSpin(&self.snapshot_mutex);
         self.snapshot = snap;
         self.snapshot_mutex.unlock();
@@ -334,7 +339,10 @@ fn handleCustom(self: *HyprEvents, data: []const u8) void {
         return;
     }
 
-    if (std.mem.eql(u8, data, "hg:hb")) {
+    // hb2 is this protocol's heartbeat; a bare hb comes from a pre-per-monitor
+    // watcher, and accepting it would keep this daemon's lapse detector quiet
+    // while no hg:mgeo ever arrived.
+    if (std.mem.eql(u8, data, "hg:hb2")) {
         self.last_hb_ms.store(nowMs(), .release);
         return;
     }
@@ -373,21 +381,25 @@ fn parseGeo(payload: []const u8) hypr.VisibleWindows {
 /// The origin travels with the geometry it describes, so a monitor that moves
 /// (a display added to its left, say) cannot leave window rects rebased
 /// against a stale origin even for one frame.
-fn parseGeoM(payload: []const u8) hypr.VisibleWindows {
+/// Returns null when the header is incomplete, so the caller can keep the
+/// previous snapshot rather than publish one with a fabricated origin.
+/// Unparsable *values* inside a complete header still degrade to 0 — the
+/// shape being right is what makes the event trustworthy.
+fn parseGeoM(payload: []const u8) ?hypr.VisibleWindows {
     var result = hypr.VisibleWindows{};
 
     var rest = payload;
 
     // wsid
-    var gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    var gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return null;
     result.workspace_id = std.fmt.parseInt(i64, rest[0..gi], 10) catch 0;
     rest = rest[gi + 1 ..];
     // origin x
-    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return null;
     result.origin_x = std.fmt.parseInt(i32, rest[0..gi], 10) catch 0;
     rest = rest[gi + 1 ..];
     // origin y
-    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return result;
+    gi = std.mem.indexOfScalar(u8, rest, group_sep) orelse return null;
     result.origin_y = std.fmt.parseInt(i32, rest[0..gi], 10) catch 0;
     rest = rest[gi + 1 ..];
 
@@ -586,11 +598,21 @@ test "handleLine hg:geo old format without wsid still parses" {
     try std.testing.expectEqual(@as(u8, 1), snap.count);
 }
 
-test "handleLine hg:hb stores heartbeat timestamp" {
+test "handleLine hg:hb2 stores heartbeat timestamp" {
     var ev = testEvents();
     try std.testing.expectEqual(@as(i64, 0), ev.lastHeartbeatMs());
-    handleLine(&ev, "custom>>hg:hb");
+    handleLine(&ev, "custom>>hg:hb2");
     try std.testing.expect(ev.lastHeartbeatMs() > 0);
+}
+
+test "handleLine a legacy hg:hb does not satisfy this daemon's heartbeat" {
+    // The pre-per-monitor watcher emits hg:hb and hg:geo. If a bare hg:hb
+    // counted, an older hyprglaze installing its watcher over ours would keep
+    // our lapse detector quiet while no hg:mgeo ever arrived — the wallpaper
+    // would freeze silently instead of triggering a reinstall.
+    var ev = testEvents();
+    handleLine(&ev, "custom>>hg:hb");
+    try std.testing.expectEqual(@as(i64, 0), ev.lastHeartbeatMs());
 }
 
 test "handleLine foreign custom events are ignored" {
@@ -719,19 +741,27 @@ test "handleLine hg:mgeo truncated headers do not bump the generation" {
     handleLine(&ev, "custom>>hg:mgeo:DP-1"); // no separator at all
     try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
 
-    // A header that stops before the origin yields a snapshot with no
-    // windows rather than one rebased against a half-parsed origin.
+    // A header that stops before the origin must not publish at all.
+    // Publishing a zero-initialised snapshot would rebase every window
+    // against origin (0,0) for a frame — on an offset monitor that is a
+    // whole-screen jump, and it is indistinguishable from a monitor that
+    // genuinely sits at the layout origin.
     handleLine(&ev, "custom>>hg:mgeo:DP-1\x1d3");
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+
+    // Stops after the origin's x — still one field short of a usable header.
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1d3\x1d100");
+    try std.testing.expectEqual(@as(u64, 0), ev.snapshotGen());
+
+    // A complete header with garbage numerics is a different case: the shape
+    // is right, so it publishes, and the unparsable fields degrade to zero.
+    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1dx\x1d10\x1d20\x1d");
+    try std.testing.expectEqual(@as(u64, 1), ev.snapshotGen());
     var snap: hypr.VisibleWindows = undefined;
     ev.copySnapshot(&snap);
-    try std.testing.expectEqual(@as(u8, 0), snap.count);
-    try std.testing.expectEqual(@as(i32, 0), snap.origin_x);
-
-    // Garbage in the numeric fields degrades to zero, never a crash.
-    handleLine(&ev, "custom>>hg:mgeo:DP-1\x1dx\x1dy\x1dz\x1d");
-    ev.copySnapshot(&snap);
     try std.testing.expectEqual(@as(i64, 0), snap.workspace_id);
-    try std.testing.expectEqual(@as(i32, 0), snap.origin_x);
+    try std.testing.expectEqual(@as(i32, 10), snap.origin_x);
+    try std.testing.expectEqual(@as(i32, 20), snap.origin_y);
 }
 
 test "handleLine legacy hg:geo while scoped triggers a reinstall instead of mixing monitors" {

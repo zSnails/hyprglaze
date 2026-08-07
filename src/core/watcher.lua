@@ -64,20 +64,62 @@ __hyprglaze.t = hl.timer(function()
         hl.dispatch(hl.dsp.event("hg:cur:" .. cx .. "," .. cy))
     end
 
-    local mons = hl.get_monitors()
+    -- Everything below runs inside the timer closure, where an error is
+    -- invisible: `hyprctl eval` already returned "ok", so the daemon believes
+    -- the install succeeded. The callback would then die before the heartbeat
+    -- dispatch, the daemon's lapse detector would fire, and it would reinstall
+    -- the same broken chunk every 3s forever with a frozen wallpaper. Degrade
+    -- to the single-monitor path instead of throwing.
+    local raw_mons = hl.get_monitors and hl.get_monitors()
+    local mons = {}
+    if type(raw_mons) == "table" then
+        for _, m in ipairs(raw_mons) do
+            -- A nil id would raise "table index is nil" below and a nil name
+            -- would fail the concat; skip such a monitor rather than letting
+            -- it kill the tick.
+            if m.id ~= nil and type(m.name) == "string" then mons[#mons + 1] = m end
+        end
+    end
+    if #mons == 0 then
+        -- Nothing usable. Still tick the heartbeat: going silent here is what
+        -- makes the daemon reinstall this same chunk every 3s forever.
+        ticks = ticks + 1
+        if ticks % 128 == 0 then hl.dispatch(hl.dsp.event("hg:hb")) end
+        return
+    end
 
-    -- Each monitor's active workspace. Compare monitors by .id rather than
-    -- by object identity: __eq is registered today but is optional on these
-    -- objects, and an id compare cannot silently degrade to always-false.
-    local midx, active = {}, {}
+    -- Each monitor's active workspace, and separately any special workspace
+    -- open over it. Compare monitors by .id rather than by object identity:
+    -- __eq is registered today but is optional on these objects, and an id
+    -- compare cannot silently degrade to always-false.
+    --
+    -- A special workspace OVERLAYS the regular one — the windows underneath
+    -- stay mapped and visible — so it gets its own slot rather than
+    -- replacing `active`. Folding it into `active` would drop every normal
+    -- window from the strip for as long as a scratchpad was open, and would
+    -- put a negative id into the emitted workspace field, which the daemon
+    -- reads as a workspace switch and snaps the wallpaper to.
+    local midx, active, special = {}, {}, {}
     for mi, m in ipairs(mons) do
         midx[m.id] = mi
-        local ws = hl.get_active_workspace(m)
-        local sp = hl.get_active_special_workspace and hl.get_active_special_workspace(m)
-        local wsid = (type(ws) == "number" and ws) or (ws and ws.id) or 0
-        -- A special workspace displaces the regular one on that monitor.
-        if sp and sp.id and sp.id ~= 0 then wsid = sp.id end
-        active[mi] = wsid
+        -- Read the monitor's own fields rather than hl.get_active_workspace(m):
+        -- that function returns the SPECIAL workspace while one is open, so
+        -- using it silently loses the regular workspace — and with it every
+        -- normal window — for as long as a scratchpad is up. The monitor
+        -- object keeps the two apart, which is the distinction that matters
+        -- here. (Hyprland's own IPC agrees: activeWorkspace stays 11 while
+        -- specialWorkspace reads -99.)
+        local aw = m.active_workspace
+        if aw == nil then aw = hl.get_active_workspace and hl.get_active_workspace(m) end
+        local aid = (type(aw) == "number" and aw) or (aw and aw.id) or 0
+        -- Belt and braces: a negative id here would be a special leaking
+        -- through, and must never become the monitor's regular workspace.
+        if aid < 0 then aid = 0 end
+        active[mi] = aid
+
+        local sw = m.active_special_workspace
+        local sid = (type(sw) == "number" and sw) or (sw and sw.id) or 0
+        if sid ~= 0 then special[mi] = sid end
     end
 
     -- Nearest existing neighbor workspaces per monitor (ids have gaps, so
@@ -101,16 +143,16 @@ __hyprglaze.t = hl.timer(function()
     for mi = 1, #mons do
         buckets[mi] = { [-1] = {}, [0] = {}, [1] = {} }
         local a = active[mi]
-        -- ~= 0 rather than > 0: a special workspace has a negative id and
-        -- must still populate its monitor's active slot.
         if a ~= 0 then
             slot_mi[a], slot_rel[a] = mi, 0
-            if a > 0 then
-                local p, n = prev_id[mi], next_id[mi]
-                if p then slot_mi[p], slot_rel[p] = mi, -1 end
-                if n then slot_mi[n], slot_rel[n] = mi, 1 end
-            end
+            local p, n = prev_id[mi], next_id[mi]
+            if p then slot_mi[p], slot_rel[p] = mi, -1 end
+            if n then slot_mi[n], slot_rel[n] = mi, 1 end
         end
+        -- The scratchpad's own windows share the active slot, so they are
+        -- tracked alongside what they cover rather than instead of it.
+        local s = special[mi]
+        if s and s ~= 0 then slot_mi[s], slot_rel[s] = mi, 0 end
     end
 
     for _, w in ipairs(hl.get_windows({ mapped = true })) do
@@ -169,6 +211,17 @@ __hyprglaze.t = hl.timer(function()
 
     ticks = ticks + 1
     if ticks % 128 == 0 then
-        hl.dispatch(hl.dsp.event("hg:hb"))
+        -- hg:hb2, not hg:hb. An older hyprglaze left running across an
+        -- upgrade ignores hg:mgeo as an unknown event but would still see a
+        -- plain hg:hb, so a shared heartbeat name keeps its lapse detector
+        -- satisfied while its geometry never updates again — a wallpaper
+        -- frozen indefinitely with nothing in its log to say why. Under a new
+        -- name the old daemon's heartbeat lapses within 6s and it reinstalls
+        -- its own watcher, which this daemon detects in turn (the legacy
+        -- hg:geo path) and reinstalls over. The two then visibly alternate
+        -- every few seconds instead of one dying quietly, which is the
+        -- difference between "something is wrong, restart it" and a wallpaper
+        -- that looks fine but stopped tracking anything an hour ago.
+        hl.dispatch(hl.dsp.event("hg:hb2"))
     end
 end, { timeout = 16, type = "repeat" })

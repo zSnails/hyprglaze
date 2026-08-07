@@ -67,6 +67,12 @@ pub const WaylandState = struct {
     /// effects that captured their dimensions at construction.
     scale_changed: bool = false,
 
+    /// True only while this struct owns a live display and registry.
+    /// `display`/`registry` are non-optional, so there is no null to fall
+    /// back on: without this flag a failed `connect` would leave them
+    /// dangling and `deinit` would free them a second time.
+    connected: bool = false,
+
     /// Output the layer surface is pinned to, copied inline. Empty = let the
     /// compositor choose. Must survive `reconnect`, so it is carried through
     /// the struct literal in `connect` rather than defaulted.
@@ -159,6 +165,11 @@ pub const WaylandState = struct {
 
         if (self.compositor == null) return error.NoCompositor;
         if (self.layer_shell == null) return error.NoLayerShell;
+
+        // Claim ownership only once every failure path above is behind us.
+        // Until this line the errdefers above own the display and registry,
+        // and `teardown` must not touch them.
+        self.connected = true;
     }
 
     /// Two-phase init: `self` must be caller-owned storage that outlives
@@ -224,11 +235,18 @@ pub const WaylandState = struct {
         // the scaled buffer back onto the surface's logical size. Both are
         // optional: without them the surface renders at logical resolution,
         // which is what it always did.
-        if (self.viewporter) |vp_mgr| self.viewport = c.wp_viewporter_get_viewport(vp_mgr, self.surface);
-        if (self.fractional_manager) |fs_mgr| {
-            self.fractional_scale = c.wp_fractional_scale_manager_v1_get_fractional_scale(fs_mgr, self.surface);
-            if (self.fractional_scale) |fs|
-                _ = c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+        if (self.viewporter) |vp_mgr| {
+            self.viewport = c.wp_viewporter_get_viewport(vp_mgr, self.surface);
+            // Only ask for a fractional scale when there is a viewport to map
+            // the resulting buffer back onto the surface's logical size.
+            // Without one, a 1.25 scale would commit a buffer 25% larger than
+            // the configured size with buffer_scale still 1 — the compositor
+            // clips it or kills the client on a protocol error.
+            if (self.fractional_manager) |fs_mgr| {
+                self.fractional_scale = c.wp_fractional_scale_manager_v1_get_fractional_scale(fs_mgr, self.surface);
+                if (self.fractional_scale) |fs|
+                    _ = c.wp_fractional_scale_v1_add_listener(fs, &fractional_scale_listener, self);
+            }
         }
 
         // Initial commit to trigger configure
@@ -273,18 +291,7 @@ pub const WaylandState = struct {
     /// is live. Caller must recreate EGL state and re-upload GL resources since the
     /// EGL display was bound to the previous wl_display pointer.
     pub fn reconnect(self: *WaylandState) !void {
-        if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
-        if (self.viewport) |vp| c.wp_viewport_destroy(vp);
-        if (self.egl_window) |win| c.wl_egl_window_destroy(win);
-        if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
-        if (self.surface) |s| c.wl_surface_destroy(s);
-        // Release the old proxies before the display goes: they belong to the
-        // connection being torn down, and `connect` rebuilds the table from
-        // the new registry.
-        self.releaseOutputs();
-        c.wl_registry_destroy(self.registry);
-        c.wl_display_disconnect(self.display);
-
+        self.teardown();
         try self.connect();
         try self.createLayerSurface();
         if (!self.configured) return error.NotConfigured;
@@ -296,15 +303,42 @@ pub const WaylandState = struct {
         self.output_count = 0;
     }
 
-    pub fn deinit(self: *WaylandState) void {
+    /// Destroy everything this struct owns and leave no field pointing at
+    /// freed memory. Idempotent, which is what makes it safe both as
+    /// `reconnect`'s first step and as `deinit` — `reconnect` can fail
+    /// anywhere in `connect`, after which main's `defer deinit` still runs.
+    fn teardown(self: *WaylandState) void {
         if (self.fractional_scale) |fs| c.wp_fractional_scale_v1_destroy(fs);
         if (self.viewport) |vp| c.wp_viewport_destroy(vp);
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
+        // Release the output proxies before the display goes: they belong to
+        // the connection being torn down, and `connect` rebuilds the table
+        // from the new registry.
         self.releaseOutputs();
-        c.wl_registry_destroy(self.registry);
-        c.wl_display_disconnect(self.display);
+        // Only when we still own them. After a failed `connect` the errdefers
+        // in there have already freed the display and registry.
+        if (self.connected) {
+            c.wl_registry_destroy(self.registry);
+            c.wl_display_disconnect(self.display);
+        }
+
+        self.fractional_scale = null;
+        self.viewport = null;
+        self.egl_window = null;
+        self.layer_surface = null;
+        self.surface = null;
+        self.compositor = null;
+        self.layer_shell = null;
+        self.viewporter = null;
+        self.fractional_manager = null;
+        self.configured = false;
+        self.connected = false;
+    }
+
+    pub fn deinit(self: *WaylandState) void {
+        self.teardown();
     }
 };
 
@@ -395,7 +429,12 @@ fn outputScale(data: ?*anyopaque, output: ?*c.wl_output, s: i32) callconv(.c) vo
     if (state.targetOutput()) |target| {
         if (target != proxy) return;
     }
-    if (s > 0) state.output_scale = s;
+    if (s <= 0 or s == state.output_scale) return;
+    state.output_scale = s;
+    // Same as fractionalPreferredScale: without this the buffer keeps its old
+    // size while scale() already reports the new one, and the next unrelated
+    // resize would resize the buffer against a stale surf_scale in main.
+    state.applyScale();
 }
 
 // --- Fractional scale listener ---

@@ -143,7 +143,16 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8, source_path: []cons
     const effect_name = if (t.get("effect")) |v| (if (v == .string) v.string else "particles") else "particles";
     const shader_str = if (t.get("shader")) |v| (if (v == .string) v.string else "") else "";
     const theme_str = if (t.get("theme")) |v| (if (v == .string) v.string else null) else null;
-    const output_str = if (t.get("output")) |v| (if (v == .string) v.string else null) else null;
+    // Unlike the keys above, a wrong-typed `output` is not silently ignored:
+    // falling back to "the focused monitor" would put two instances driven
+    // from the same config template onto the same screen, and the adjacent
+    // failure — a well-formed name that matches nothing — is already fatal.
+    // Warn so the two paths do not give opposite diagnostics for one key.
+    const output_str = if (t.get("output")) |v| blk: {
+        if (v == .string) break :blk v.string;
+        log.warn("config key 'output' must be a quoted string — ignoring it", .{});
+        break :blk null;
+    } else null;
 
     // Read core sections
     const transition_params = effectParamsFromTable(t, "transition");

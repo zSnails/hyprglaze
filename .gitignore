@@ -38,3 +38,4 @@ sprites/character.png
 .playwright-mcp/
 LGFae-swww/
 *.mp4
+tools/__pycache__/

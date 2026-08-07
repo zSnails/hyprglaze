@@ -100,6 +100,22 @@ test "scale maps logical coordinates onto a larger buffer" {
     try std.testing.expectApproxEqAbs(@as(f32, 750), r.h, 0.001);
 }
 
+test "a non-zero origin and a non-unity scale compose in the right order" {
+    // The other tests all hold either scale == 1 or origin == 0, and under
+    // both of those the wrong implementation `x * scale - ox` agrees with the
+    // correct `(x - ox) * scale`. This is the only case that separates them:
+    // a 3840x2160 monitor at scale 1.25 is 3072 logical wide, so its
+    // right-hand neighbour starts at layout x=3072, and a window 100 logical
+    // px into that monitor belongs at buffer x=125 — not 890.
+    const r = toGl(3072 + 100, 50, 800, 600, 3072, 0, 2160, 1.25);
+    try std.testing.expectApproxEqAbs(@as(f32, 125), r.x, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), r.w, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2160 - 812.5), r.y, 0.001);
+
+    const p = toGlPoint(3072 + 100, 50, 3072, 0, 2160, 1.25);
+    try std.testing.expectApproxEqAbs(@as(f32, 125), p[0], 0.001);
+}
+
 test "toGlPoint agrees with toGl for a zero-height rect" {
     const p = toGlPoint(3072 + 400, 300, 3072, 0, 1728, 1.0);
     const r = toGl(3072 + 400, 300, 0, 0, 3072, 0, 1728, 1.0);
