@@ -7,16 +7,13 @@ const shader_mod = @import("core/shader.zig");
 const hypr = @import("core/hypr.zig");
 const palette_mod = @import("core/palette.zig");
 const transition = @import("core/transition.zig");
+const geometry = @import("core/geometry.zig");
 const workspace_slide = @import("core/workspace_slide.zig");
 const config_mod = @import("core/config.zig");
 const watcher_mod = @import("core/watcher.zig");
 const hypr_events = @import("core/hypr_events.zig");
 const effects = @import("effects.zig");
 const particles = @import("effects/particles/system.zig");
-
-const c = @cImport({
-    @cInclude("wayland-client.h");
-});
 
 pub const std_options: std.Options = .{ .log_level = .info };
 const log = std.log.scoped(.hyprglaze);
@@ -28,6 +25,7 @@ fn onSignal(_: std.posix.SIG) callconv(.c) void {
 }
 
 const CliArgs = struct {
+    output: ?[]const u8 = null,
     shader_path: ?[]const u8 = null,
     theme_name: ?[]const u8 = null,
     config_path: ?[]const u8 = null,
@@ -60,6 +58,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (cli.config_path) |p| allocator.free(p);
         if (cli.effect_name) |e| allocator.free(e);
         if (cli.set_theme) |t| allocator.free(t);
+        if (cli.output) |o| allocator.free(o);
     }
 
     if (cli.list_themes) {
@@ -127,11 +126,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
 
-    const mon = ipc.primaryMonitor(allocator) catch |err| {
-        log.err("failed to query monitor: {}", .{err});
+    const mon = ipc.monitor(allocator, cfg.output) catch |err| {
+        if (err == error.MonitorNotFound) {
+            log.err("no output named '{s}'", .{cfg.output.?});
+            ipc.logMonitorNames(allocator);
+        } else {
+            log.err("failed to query monitor: {}", .{err});
+        }
         return err;
     };
-    log.info("monitor: {d}x{d} scale={d:.2}", .{ mon.width, mon.height, mon.scale });
+    log.info("output: {s} {d}x{d} @({d},{d}) scale={d:.2}", .{
+        mon.outputName(), mon.width, mon.height, mon.x, mon.y, mon.scale,
+    });
 
     // Detect Hyprland's workspace animation so switches mirror the
     // compositor's own slide (direction, duration, easing). Refreshed on
@@ -152,14 +158,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Wayland. Two-phase init: `wl`'s address becomes listener userdata,
     // so it must live here, not in a temporary inside init().
     var wl: wayland.WaylandState = undefined;
-    wl.init() catch |err| {
+    wl.init(mon.outputName()) catch |err| {
         log.err("Wayland init failed: {}", .{err});
         return err;
     };
     defer wl.deinit();
 
     wl.createLayerSurface() catch |err| {
-        log.err("layer surface creation failed: {}", .{err});
+        if (err == error.OutputNotFound) {
+            // Hyprland knows this monitor but Wayland does not advertise a
+            // matching output — the discrepancy between the two lists is the
+            // diagnosis, so print both.
+            log.err("Hyprland reports output '{s}' but no matching wl_output exists", .{mon.outputName()});
+            wl.logOutputNames();
+        } else {
+            log.err("layer surface creation failed: {}", .{err});
+        }
         return err;
     };
 
@@ -186,11 +200,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (pal) |*p| shader_prog.setPalette(p);
 
-    // Re-init effect with actual dimensions
-    var surf_w: f32 = @floatFromInt(wl.width);
-    var surf_h: f32 = @floatFromInt(wl.height);
-    effect.deinit();
-    effect = try effects.Effect.init(cfg.effect, allocator, surf_w, surf_h, &cfg);
+    // Re-init effect with actual dimensions. These are BUFFER pixels, which
+    // on a scaled output are larger than the logical size the layer surface
+    // was configured with — everything downstream (glViewport, iResolution,
+    // the layout-to-surface transform) works in this one unit.
+    var surf_w: f32 = @floatFromInt(wl.buffer_width);
+    var surf_h: f32 = @floatFromInt(wl.buffer_height);
+    var surf_scale: f32 = wl.scale();
+    wl.scale_changed = false;
+    if (surf_scale != 1.0)
+        log.info("rendering at {d}x{d} for a {d}x{d} surface (scale {d:.2})", .{
+            wl.buffer_width, wl.buffer_height, wl.width, wl.height, surf_scale,
+        });
+    // Via rebuildEffect rather than deinit-then-init: on a large output this
+    // is the first allocation at real size and can fail, and the naive order
+    // would leave `effect` holding a deinited union for the `defer` above to
+    // free a second time. Effect.deinit has no idempotence guard.
+    _ = rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h);
 
     log.info("entering render loop", .{});
 
@@ -249,6 +275,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const initial_addr: u64 = if (initial_focus) |w| w.address else 0;
     events.focused_address.store(initial_addr, .release);
 
+    // Scope the event stream to our output before the reader exists: the
+    // shared watcher emits one geometry event per monitor and every other
+    // monitor's is dropped. Seed the origin from the startup query so the
+    // first frames are already rebased; from the first watcher event on, the
+    // origin arrives with the geometry it describes.
+    if (mon.name_len == 0) {
+        // Without a name there is nothing to filter the shared watcher's
+        // per-monitor events by, so this daemon would follow whichever
+        // monitor emitted last — the very bug the filter exists to prevent.
+        log.err("Hyprland reported a monitor with no name; cannot scope to an output", .{});
+        return error.BadMonitorReply;
+    }
+    events.setMonitor(mon.outputName());
+    events.snapshot.origin_x = mon.x;
+    events.snapshot.origin_y = mon.y;
+
     // Start the reader, then install the in-compositor Lua watcher. Its
     // first tick emits cursor + geometry unconditionally, so waiting
     // briefly for the first snapshot gives us a real seed state.
@@ -268,16 +310,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
         log.warn("no snapshot from watcher within 300ms — starting with empty state", .{});
     _ = events.takeDirty(); // clear the initial resync flag — we just installed
 
-    const initial_cursor = events.cursorPos();
-    const seed_cursor = [2]f32{
-        @floatFromInt(initial_cursor.x),
-        surf_h - @as(f32, @floatFromInt(initial_cursor.y)),
-    };
-
+    // The snapshot must be read before the cursor is seeded: the cursor is
+    // rebased against the monitor origin the snapshot carries.
     var cached_snapshot = hypr.VisibleWindows{};
     var last_snapshot_gen = events.snapshotGen();
     events.copySnapshot(&cached_snapshot);
     slide.seed(cached_snapshot.workspace_id);
+
+    const initial_cursor = events.cursorPos();
+    const seed_cursor = geometry.toGlPoint(
+        initial_cursor.x,
+        initial_cursor.y,
+        cached_snapshot.origin_x,
+        cached_snapshot.origin_y,
+        surf_h,
+        surf_scale,
+    );
 
     const raw0 = deriveRawState(
         &cached_snapshot,
@@ -285,6 +333,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         initial_addr,
         slide.axis,
         if (slide.axis == .vertical) surf_h else surf_w,
+        surf_scale,
     );
     trans.seed(raw0.win, seed_cursor, raw0.win_address);
     cacheWindows(&cached_windows, &cached_collision_rects, &cached_window_count, &raw0);
@@ -316,37 +365,92 @@ pub fn main(init: std.process.Init.Minimal) !void {
     drawFrame(&shader_prog, &egl_state, surf_w, surf_h, 0.0, &trans, &cached_windows, cached_window_count);
     egl_state.swapBuffers() catch |err| log.warn("initial swapBuffers error: {}", .{err});
 
-    // Main loop
-    while (!wl.should_close and !should_exit.load(.acquire)) {
+    // Bounded retries for a failed effect resize; see the resize block.
+    var resize_retries: u8 = 0;
+    // Set when the surface changed size, to force one re-derive of the cached
+    // window rects: they hold surface-space coordinates flipped about the old
+    // height, and a resize produces no watcher snapshot to trigger that.
+    var surface_resized = false;
+
+    // Main loop.
+    //
+    // `target_gone` is part of the CONDITION, not a check in the body. In the
+    // body it raced `should_close` — an output going away usually closes the
+    // layer surface in the same dispatch, so the condition ended the loop
+    // first and the body never ran. Purely after the loop it was worse: an
+    // output can be removed WITHOUT the surface closing, and then nothing
+    // ended the loop at all and the daemon spun forever on a monitor that no
+    // longer existed. Here, whichever happens first stops the loop, and the
+    // check after it decides how to exit.
+    while (!wl.should_close and !wl.target_gone and !should_exit.load(.acquire)) {
         wl.dispatch() catch |err| {
             if (should_exit.load(.acquire)) break;
             log.warn("Wayland dispatch error: {} — reconnecting in 1s", .{err});
             iohelp.sleepNs(1 * std.time.ns_per_s);
+            // Tear EGL down BEFORE reconnect, which destroys the wl_display
+            // the EGL surface is built on. Leaving it until afterwards means
+            // eglDestroySurface — from recreateGraphics on the way in, or from
+            // this function's own `defer` if the reconnect fails — walks into
+            // a freed display inside the driver's Wayland platform layer and
+            // segfaults. deinit is idempotent, so the later calls are no-ops.
+            egl_state.deinit();
             wl.reconnect() catch |e2| {
                 log.err("Wayland reconnect failed: {} — exiting", .{e2});
                 return e2;
             };
-            recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &pal, &wl, shader_path_expanded) catch |e2| {
+            recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &cfg, &pal, &wl, shader_path_expanded) catch |e2| {
                 log.err("graphics reinit failed after Wayland reconnect: {} — exiting", .{e2});
                 return e2;
             };
-            surf_w = @floatFromInt(wl.width);
-            surf_h = @floatFromInt(wl.height);
+            surf_w = @floatFromInt(wl.buffer_width);
+            surf_h = @floatFromInt(wl.buffer_height);
+            surf_scale = wl.scale();
             wl.resize_pending = false;
+            wl.scale_changed = false;
             try wl.requestFrame();
             continue;
         };
 
-        if (wl.resize_pending) {
-            surf_w = @floatFromInt(wl.width);
-            surf_h = @floatFromInt(wl.height);
+        if (wl.resize_pending or wl.scale_changed) {
+            const new_w: f32 = @floatFromInt(wl.buffer_width);
+            const new_h: f32 = @floatFromInt(wl.buffer_height);
+            // Rebuild on any change to the BUFFER size, not just a scale
+            // change. Effects capture their bounds at init — milkdrop sizes
+            // its FBOs, swarm its canvas — so a plain resolution change with
+            // the scale untouched would leave every one of them drawing at
+            // the old dimensions.
+            const dims_changed = new_w != surf_w or new_h != surf_h;
+            surf_w = new_w;
+            surf_h = new_h;
+            surf_scale = wl.scale();
+            // Window rects are cached in surface space, and the y-flip that
+            // produced them used the OLD height. Nothing else re-derives them:
+            // a resize emits no new watcher snapshot, so without this the
+            // rects stay flipped about the previous surface for as long as no
+            // window happens to move — every effect drawing them off by the
+            // difference between the two heights.
+            if (dims_changed) surface_resized = true;
+            if (dims_changed and !rebuildEffect(allocator, &effect, &cfg, surf_w, surf_h)) {
+                // A transient failure (an FBO allocation losing a race with
+                // something else on the GPU) would otherwise strand the effect
+                // at the old size for the life of the process, since nothing
+                // re-raises the flag. Retry on the next frames, bounded so a
+                // permanent failure does not spin.
+                if (resize_retries < 3) {
+                    resize_retries += 1;
+                    continue;
+                }
+                log.err("effect stuck at the old size after {d} attempts", .{resize_retries});
+            }
+            resize_retries = 0;
             wl.resize_pending = false;
+            wl.scale_changed = false;
         }
 
         if (config_watcher) |*cw| {
             if (cw.poll()) {
                 log.info("config changed, reloading", .{});
-                reloadConfig(allocator, &cfg, &effect, &shader_prog, &pal, &trans, &shader_path_expanded, surf_w, surf_h) catch |err| {
+                reloadConfig(allocator, &cfg, &effect, &shader_prog, &pal, &trans, &shader_path_expanded, surf_w, surf_h, mon.outputName()) catch |err| {
                     log.warn("reload failed: {}", .{err});
                 };
                 configureSlide(&slide, detected_anim, &cfg);
@@ -366,8 +470,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // Cursor arrives as push (`hg:cur` events) — reading the
             // atomics is free, so sample every frame.
             const cursor = events.cursorPos();
-            cached_cursor[0] = @floatFromInt(cursor.x);
-            cached_cursor[1] = surf_h - @as(f32, @floatFromInt(cursor.y));
+            cached_cursor = geometry.toGlPoint(
+                cursor.x,
+                cursor.y,
+                cached_snapshot.origin_x,
+                cached_snapshot.origin_y,
+                surf_h,
+                surf_scale,
+            );
             const raw_cursor = cached_cursor;
 
             // Pull focus from the event stream. A change forces an
@@ -379,7 +489,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
             const dirty = events.takeDirty();
             if (dirty.monitor) {
-                log.info("monitor topology changed — restart hyprglaze if displays are reconfigured", .{});
+                // No re-query needed: the origin is part of the watcher's
+                // change key, so a monitor appearing to our left re-emits our
+                // geometry with the corrected origin within one 16ms tick,
+                // window event or not.
+                log.info("monitor topology changed", .{});
             }
             // Config reload recreates Hyprland's Lua state (killing the
             // watcher); a socket2 reconnect means change-only events may
@@ -387,9 +501,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // which re-emits the full state on its first tick. The
             // heartbeat lapse catches anything else that kills the watcher.
             const hb_stale = hypr_events.nowMs() - events.lastHeartbeatMs() > hb_lapse_ms;
-            if ((dirty.config or dirty.resync or hb_stale) and time_f64 - last_install_attempt >= reinstall_min_gap) {
+            if ((dirty.config or dirty.resync or dirty.legacy or hb_stale) and time_f64 - last_install_attempt >= reinstall_min_gap) {
                 last_install_attempt = time_f64;
                 if (dirty.config) log.info("Hyprland reloaded its config — reinstalling watcher", .{});
+                if (dirty.legacy) log.warn("an older hyprglaze replaced the watcher — reinstalling", .{});
                 if (hb_stale) log.warn("watcher heartbeat lapsed — reinstalling", .{});
                 installWatcher(&ipc, &events) catch |err| {
                     log.warn("watcher reinstall failed: {} — retrying in {d}s", .{ err, @as(u32, @intFromFloat(reinstall_min_gap)) });
@@ -407,7 +522,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // every 16ms tick and pushes a fresh snapshot.
             const gen = events.snapshotGen();
             var force_snap = false;
-            if (focus_changed or gen != last_snapshot_gen) {
+            if (focus_changed or gen != last_snapshot_gen or surface_resized) {
+                surface_resized = false;
                 if (gen != last_snapshot_gen) {
                     last_snapshot_gen = gen;
                     events.copySnapshot(&cached_snapshot);
@@ -430,6 +546,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     cached_win_address,
                     slide.axis,
                     if (slide.axis == .vertical) surf_h else surf_w,
+                    surf_scale,
                 );
                 target_window_count = raw.window_count;
                 for (0..raw.window_count) |i| {
@@ -555,7 +672,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             egl_state.swapBuffers() catch |err| {
                 if (err == error.EglContextLost) {
                     log.warn("EGL context lost — reinitialising graphics", .{});
-                    try recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &pal, &wl, shader_path_expanded);
+                    try recreateGraphics(allocator, &egl_state, &shader_prog, &effect, &cfg, &pal, &wl, shader_path_expanded);
                 } else {
                     log.warn("eglSwapBuffers error: {}", .{err});
                 }
@@ -572,17 +689,59 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
     }
+
+    // Asked here rather than inside the loop, because losing an output sets
+    // `target_gone` and closes the layer surface in the same dispatch: any
+    // in-loop check races the `should_close` condition and loses. After the
+    // loop it does not matter which flag ended it.
+    //
+    // A clean exit would be exit 0, which `Restart=on-failure` ignores — and
+    // for one instance per monitor, a monitor going away and coming back is
+    // the routine case rather than an exceptional one.
+    if (wl.target_gone) {
+        log.err("output '{s}' was removed", .{wl.targetName()});
+        return error.OutputRemoved;
+    }
 }
 
-/// Tear down and rebuild the GL pipeline: EGL state, shader program, and
-/// re-upload the effect's uniforms. Used after a Wayland reconnect or an
-/// `EglContextLost`. The palette pointer is re-bound if present. Caller is
-/// responsible for any post-reinit work (surface dimensions, requestFrame).
+/// Re-init the active effect at new dimensions, in place.
+///
+/// Never leaves `effect` holding a deinited value: the old context is only
+/// released once a replacement exists, so an error here cannot set up a
+/// double-deinit through main's `defer effect.deinit()`. On failure the
+/// existing effect keeps running at the old size, which is wrong but visible,
+/// rather than taking the wallpaper down.
+///
+/// The replacement is built from the LIVE union tag, not from `cfg.effect`:
+/// a `reloadConfig` that swapped the effect and then bailed before committing
+/// the config leaves those two disagreeing, and resolving by name would
+/// silently swap the running effect for a different one on the next resize.
+fn rebuildEffect(
+    allocator: std.mem.Allocator,
+    effect: *effects.Effect,
+    cfg: *const config_mod.Config,
+    w: f32,
+    h: f32,
+) bool {
+    const fresh = effects.Effect.init(effect.cliNameOf(), allocator, w, h, cfg) catch |err| {
+        log.warn("effect resize to {d}x{d} failed: {} — keeping the old size", .{ w, h, err });
+        return false;
+    };
+    effect.deinit();
+    effect.* = fresh;
+    return true;
+}
+
+/// Tear down and rebuild the GL pipeline: EGL state, shader program, and the
+/// effect. Used after a Wayland reconnect or an `EglContextLost`. The palette
+/// pointer is re-bound if present. Caller is responsible for any post-reinit
+/// work (surface dimensions, requestFrame).
 fn recreateGraphics(
     allocator: std.mem.Allocator,
     egl_state: *egl_mod.EglState,
     shader_prog: *shader_mod.ShaderProgram,
     effect: *effects.Effect,
+    cfg: *const config_mod.Config,
     pal: *?palette_mod.Palette,
     wl: *const wayland.WaylandState,
     shader_path_expanded: []const u8,
@@ -594,6 +753,11 @@ fn recreateGraphics(
     defer allocator.free(new_frag);
     shader_prog.* = try shader_mod.ShaderProgram.init(new_frag);
     if (pal.*) |*p| shader_prog.setPalette(p);
+    // eglDestroyContext above invalidated every GL name, including the ones
+    // effects own themselves — milkdrop's FBO and textures, swarm's program.
+    // Re-uploading uniforms is not enough; those objects have to be rebuilt or
+    // the effect draws nothing until the daemon is restarted.
+    _ = rebuildEffect(allocator, effect, cfg, @floatFromInt(wl.buffer_width), @floatFromInt(wl.buffer_height));
     effect.upload(shader_prog);
 }
 
@@ -707,6 +871,13 @@ const RawState = struct {
 /// state. Pushes `custom>>hg:*` events on socket2 (see hypr_events.zig).
 const watcher_lua = @embedFile("core/watcher.lua");
 
+comptime {
+    // An over-budget chunk is otherwise a runtime error.CodeTooLong,
+    // discovered only against a live compositor.
+    if (watcher_lua.len > hypr.HyprIpc.max_eval_chunk)
+        @compileError("watcher.lua exceeds HyprIpc.eval's command buffer");
+}
+
 /// (Re)install the watcher. Idempotent — the chunk disables any previous
 /// timer first, and its first tick re-emits cursor + geometry
 /// unconditionally. Seeds the heartbeat clock so the lapse detector
@@ -731,6 +902,7 @@ fn deriveRawState(
     focused_address: u64,
     axis: workspace_slide.Axis,
     span: f32,
+    scale: f32,
 ) RawState {
     var windows: [hypr.max_visible_windows]shader_mod.ShaderProgram.WindowRect = undefined;
     var win_info: [hypr.max_visible_windows]effects.WindowInfo = undefined;
@@ -741,11 +913,21 @@ fn deriveRawState(
         const vw = visible.windows[i];
         if (axis == .none and vw.rel != 0) continue;
         const out = count;
+        const r = geometry.toGl(
+            vw.x,
+            vw.y,
+            vw.w,
+            vw.h,
+            visible.origin_x,
+            visible.origin_y,
+            surf_h,
+            scale,
+        );
         windows[out] = .{
-            .x = @floatFromInt(vw.x),
-            .y = surf_h - (@as(f32, @floatFromInt(vw.y)) + @as(f32, @floatFromInt(vw.h))),
-            .w = @floatFromInt(vw.w),
-            .h = @floatFromInt(vw.h),
+            .x = r.x,
+            .y = r.y,
+            .w = r.w,
+            .h = r.h,
             .address = vw.address,
         };
         applyOffset(&windows[out].x, &windows[out].y, axis, @as(f32, @floatFromInt(vw.rel)) * span);
@@ -806,10 +988,13 @@ fn loadConfig(allocator: std.mem.Allocator, cli: *const CliArgs) !config_mod.Con
             errdefer allocator.free(shader_dup);
             const theme_dup = if (cli.theme_name) |t| try allocator.dupe(u8, t) else null;
             errdefer if (theme_dup) |td| allocator.free(td);
+            const output_dup = if (cli.output) |o| try allocator.dupe(u8, o) else null;
+            errdefer if (output_dup) |od| allocator.free(od);
             return .{
                 .effect = effect_dup,
                 .shader = shader_dup,
                 .theme = theme_dup,
+                .output = output_dup,
                 .transition_duration = 0.3,
                 .cursor_smoothing = 0.15,
                 .geometry_smoothing = 0.12,
@@ -836,6 +1021,10 @@ fn loadConfig(allocator: std.mem.Allocator, cli: *const CliArgs) !config_mod.Con
         if (cfg.theme) |old| allocator.free(old);
         cfg.theme = try allocator.dupe(u8, tn);
     }
+    if (cli.output) |o| {
+        if (cfg.output) |old| allocator.free(old);
+        cfg.output = try allocator.dupe(u8, o);
+    }
 
     return cfg;
 }
@@ -850,12 +1039,23 @@ fn reloadConfig(
     current_shader_path: *[]const u8,
     surf_w: f32,
     surf_h: f32,
+    active_output: []const u8,
 ) !void {
     var new_cfg = try config_mod.load(allocator, cfg.config_path);
 
     trans.transition_duration = new_cfg.transition_duration;
     trans.cursor_smoothing = new_cfg.cursor_smoothing;
     trans.geometry_smoothing = new_cfg.geometry_smoothing;
+
+    // The layer surface is bound to its output when it is created, so this
+    // one cannot hot-apply. Compare against the output actually in use rather
+    // than against cfg.output: a reload re-reads the file without re-applying
+    // CLI overrides, so cfg.output would report the file's value even when
+    // --output won at startup.
+    if (new_cfg.output) |want| {
+        if (!std.mem.eql(u8, want, active_output))
+            log.warn("output changed to '{s}' — restart hyprglaze to apply", .{want});
+    }
 
     // Theme change
     if (!strEql(cfg.theme, new_cfg.theme)) {
@@ -938,6 +1138,8 @@ const usage_text =
     \\
     \\Usage: hyprglaze [options]
     \\
+    \\  --output NAME      Monitor to render on, per `hyprctl monitors`
+    \\                     (default: the focused monitor at startup)
     \\  --config PATH      TOML config path (default: ~/.config/hypr/hyprglaze.toml)
     \\  --effect NAME      Effect to render (see --list-effects)
     \\  --shader PATH      Fragment shader path (overrides effect default)
@@ -960,6 +1162,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
         if (out.shader_path) |p| allocator.free(p);
         if (out.theme_name) |p| allocator.free(p);
         if (out.set_theme) |p| allocator.free(p);
+        if (out.output) |p| allocator.free(p);
     }
 
     // Skip argv[0] (the program path).
@@ -974,7 +1177,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
             value = arg[eq + 1 ..];
         }
 
-        const StrField = enum { config, effect, shader, theme, set_theme };
+        const StrField = enum { config, effect, shader, theme, set_theme, output };
         const BoolField = enum { list_themes, list_effects, fps, help };
 
         const str_kind: ?StrField = if (std.mem.eql(u8, key, "--config")) .config
@@ -982,6 +1185,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
             else if (std.mem.eql(u8, key, "--shader")) .shader
             else if (std.mem.eql(u8, key, "--theme")) .theme
             else if (std.mem.eql(u8, key, "--set-theme")) .set_theme
+            else if (std.mem.eql(u8, key, "--output")) .output
             else null;
 
         if (str_kind) |sk| {
@@ -1000,6 +1204,7 @@ fn parseCli(allocator: std.mem.Allocator, raw_argv: []const [*:0]const u8) !CliA
                 .shader => out.shader_path = dup,
                 .theme => out.theme_name = dup,
                 .set_theme => out.set_theme = dup,
+                .output => out.output = dup,
             }
             continue;
         }

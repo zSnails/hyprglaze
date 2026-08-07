@@ -1,0 +1,36 @@
+[Unit]
+Description=hyprglaze shader wallpaper daemon (%I)
+Documentation=https://github.com/slastra/hyprglaze
+PartOf=graphical-session.target
+After=graphical-session.target
+
+# A monitor that is away for more than a few seconds means several failed
+# starts in a row: the output is still missing, so startup fails again. Under
+# systemd's default 5-starts-per-10s limit the unit would give up permanently
+# and need a manual `systemctl --user reset-failed`, which is the opposite of
+# what the restart policy is here for. Retry indefinitely instead.
+StartLimitIntervalSec=0
+
+# One instance per monitor:
+#   systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
+# Names come from `hyprctl monitors -j | jq -r '.[].name'`. Do not enable
+# hyprglaze.service alongside this for the same screen — both would render.
+#
+# Requires a session that actually reaches graphical-session.target (uwsm or
+# equivalent). Hyprland started directly never activates it, and these units
+# would then run once from `--now` and never again; launch from hyprland.lua
+# with hl.exec_cmd instead. See the README.
+
+[Service]
+Type=simple
+# %I rather than %i: identical for a plain connector name, but it also
+# survives an escaped instance name.
+ExecStart=/usr/bin/hyprglaze --output %I
+# The daemon exits non-zero when its pinned output disappears, so this is what
+# brings the wallpaper back when the monitor returns.
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=graphical-session.target

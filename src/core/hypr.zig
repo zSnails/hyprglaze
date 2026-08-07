@@ -3,6 +3,8 @@ const posix = std.posix;
 const libc = @import("io_helper.zig").libc;
 const workspace_slide = @import("workspace_slide.zig");
 
+const log = std.log.scoped(.hypr_ipc);
+
 pub const CursorPos = struct {
     x: i32,
     y: i32,
@@ -41,6 +43,12 @@ pub const VisibleWindows = struct {
     /// window set, so a workspace switch can never race its geometry).
     /// 0 = unknown: old-format watcher payload or parse failure.
     workspace_id: i64 = 0,
+    /// Layout-space origin of the monitor this snapshot describes. Window
+    /// rects arrive as global layout coords; subtracting this makes them
+    /// surface-local. Carried inside the snapshot so a monitor that moves
+    /// can never leave rects rebased against a stale origin.
+    origin_x: i32 = 0,
+    origin_y: i32 = 0,
 };
 
 /// Effective workspace-animation config detected from Hyprland, used to
@@ -52,12 +60,26 @@ pub const WorkspaceAnim = struct {
     ease: workspace_slide.Ease,
 };
 
+/// One monitor as Hyprland reports it. Note the mixed units: `width`/`height`
+/// are the physical mode in pixels, while `x`/`y` are the *logical* layout
+/// origin (a 3840x2160 monitor at scale 1.25 occupies 3072x1728 of layout
+/// space, so its right-hand neighbour starts at x=3072). Window and cursor
+/// coordinates are logical too, so `x`/`y` are what to subtract; the logical
+/// size, if ever needed, is `width / scale`.
 pub const MonitorInfo = struct {
+    /// Output name, copied inline: it is read out of a std.json tree that
+    /// parseMonitor frees before returning.
+    name: [64]u8 = undefined,
+    name_len: u8 = 0,
     x: i32,
     y: i32,
     width: i32,
     height: i32,
     scale: f32,
+
+    pub fn outputName(self: *const MonitorInfo) []const u8 {
+        return self.name[0..self.name_len];
+    }
 };
 
 fn parseAddress(val: std.json.Value) u64 {
@@ -124,6 +146,10 @@ pub const HyprIpc = struct {
             if (n == 0) break;
             total += n;
         }
+        // A reply that exactly fills the buffer is indistinguishable from one
+        // that was cut short, and silently handing back a truncated JSON body
+        // turns into a confusing parse failure several frames later. Say so.
+        if (total == buf.len) return error.ReplyTruncated;
         return buf[0..total];
     }
 
@@ -131,11 +157,19 @@ pub const HyprIpc = struct {
     /// Lua config manager (Hyprland ≥0.55). Returns error.EvalRejected
     /// when the compositor reports anything other than "ok" — typically a
     /// Lua error, or a classic hyprlang config where eval is unsupported.
+    /// Upper bound on a chunk this can send. watcher.lua is the only caller
+    /// and sits well inside it; the headroom is so its documentation header
+    /// never has to be traded against the buffer size.
+    pub const max_eval_chunk = eval_cmd_buf_len - "eval ".len;
+    const eval_cmd_buf_len = 16384;
+
     pub fn eval(self: *const HyprIpc, code: []const u8) !void {
-        var cmd_buf: [8192]u8 = undefined;
+        var cmd_buf: [eval_cmd_buf_len]u8 = undefined;
         const cmd = std.fmt.bufPrint(&cmd_buf, "eval {s}", .{code}) catch return error.CodeTooLong;
 
-        var reply_buf: [4096]u8 = undefined;
+        // Roomy enough for a multi-line Lua traceback: truncating the error
+        // reply would itself surface as a bare EvalRejected with no clue why.
+        var reply_buf: [8192]u8 = undefined;
         const reply = try self.query(cmd, &reply_buf);
         if (!std.mem.eql(u8, std.mem.trimEnd(u8, reply, "\n"), "ok")) {
             std.log.scoped(.hypr_ipc).err("eval rejected: {s}", .{reply});
@@ -200,37 +234,110 @@ pub const HyprIpc = struct {
         return parseWorkspaceAnim(allocator, response);
     }
 
-    pub fn primaryMonitor(self: *const HyprIpc, allocator: std.mem.Allocator) !MonitorInfo {
-        var buf: [8192]u8 = undefined;
+    /// The monitor to render on. `want` names an output exactly; when it is
+    /// null the focused monitor is chosen, falling back to the first enabled
+    /// one. Split from `parseMonitor` the same way `workspaceAnim` is split
+    /// from `parseWorkspaceAnim`, so the selection rules are unit-testable
+    /// without a live compositor.
+    pub fn monitor(self: *const HyprIpc, allocator: std.mem.Allocator, want: ?[]const u8) !MonitorInfo {
+        // `j/monitors` runs ~1.8KiB per monitor — `availableModes` alone is
+        // over a kilobyte — so the old 8KiB buffer truncated from about five
+        // monitors up, which is exactly the population this flag serves.
+        var buf: [32768]u8 = undefined;
         const response = try self.query("j/monitors", &buf);
+        return parseMonitor(allocator, response, want);
+    }
 
-        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    /// Log every output Hyprland currently reports, so a name that matched
+    /// nothing can be diagnosed without a second command.
+    pub fn logMonitorNames(self: *const HyprIpc, allocator: std.mem.Allocator) void {
+        var buf: [32768]u8 = undefined;
+        const response = self.query("j/monitors", &buf) catch return;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, response, .{}) catch return;
         defer parsed.deinit();
-
-        // Use first monitor. Guard every access: an error reply or an
-        // empty monitor list must error out, not panic.
-        if (parsed.value != .array or parsed.value.array.items.len == 0)
-            return error.BadMonitorReply;
-        const first = parsed.value.array.items[0];
-        if (first != .object) return error.BadMonitorReply;
-        const mon = first.object;
-
-        const scale_val = mon.get("scale");
-        const scale: f32 = if (scale_val) |sv| switch (sv) {
-            .float => @floatCast(sv.float),
-            .integer => @floatFromInt(sv.integer),
-            else => 1.0,
-        } else 1.0;
-
-        return .{
-            .x = jsonInt(mon.get("x")) orelse return error.BadMonitorReply,
-            .y = jsonInt(mon.get("y")) orelse return error.BadMonitorReply,
-            .width = jsonInt(mon.get("width")) orelse return error.BadMonitorReply,
-            .height = jsonInt(mon.get("height")) orelse return error.BadMonitorReply,
-            .scale = scale,
-        };
+        if (parsed.value != .array) return;
+        for (parsed.value.array.items) |item| {
+            if (item != .object) continue;
+            const n = item.object.get("name") orelse continue;
+            if (n != .string) continue;
+            const disabled = if (item.object.get("disabled")) |d| d == .bool and d.bool else false;
+            log.info("  available output: {s}{s}", .{ n.string, if (disabled) " (disabled)" else "" });
+        }
     }
 };
+
+/// Pick a monitor out of a `j/monitors` reply.
+///
+/// A disabled monitor has no `wl_output`, so selecting one would only fail
+/// later when the layer surface tries to bind it — they are skipped unless
+/// named explicitly.
+fn parseMonitor(allocator: std.mem.Allocator, response: []const u8, want: ?[]const u8) !MonitorInfo {
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, response, .{});
+    defer parsed.deinit();
+
+    // Guard every access: an error reply or an empty monitor list must error
+    // out, not panic.
+    if (parsed.value != .array or parsed.value.array.items.len == 0)
+        return error.BadMonitorReply;
+    const items = parsed.value.array.items;
+
+    if (want) |name| {
+        for (items) |item| {
+            if (item != .object) continue;
+            const n = item.object.get("name") orelse continue;
+            if (n == .string and std.mem.eql(u8, n.string, name)) return monitorFromJson(item.object);
+        }
+        // Never fall back to another monitor here. Reporting one monitor's
+        // geometry while the surface lands on a different output is far
+        // harder to diagnose than an outright failure.
+        return error.MonitorNotFound;
+    }
+
+    var first_enabled: ?std.json.ObjectMap = null;
+    for (items) |item| {
+        if (item != .object) continue;
+        const mon = item.object;
+        const disabled = if (mon.get("disabled")) |d| d == .bool and d.bool else false;
+        if (disabled) continue;
+        if (first_enabled == null) first_enabled = mon;
+        if (mon.get("focused")) |f| {
+            if (f == .bool and f.bool) return monitorFromJson(mon);
+        }
+    }
+    if (first_enabled) |mon| return monitorFromJson(mon);
+
+    if (items[0] != .object) return error.BadMonitorReply;
+    return monitorFromJson(items[0].object);
+}
+
+fn monitorFromJson(mon: std.json.ObjectMap) !MonitorInfo {
+    const scale: f32 = if (mon.get("scale")) |sv| switch (sv) {
+        .float => @floatCast(sv.float),
+        .integer => @floatFromInt(sv.integer),
+        else => 1.0,
+    } else 1.0;
+
+    var result = MonitorInfo{
+        .x = jsonInt(mon.get("x")) orelse return error.BadMonitorReply,
+        .y = jsonInt(mon.get("y")) orelse return error.BadMonitorReply,
+        .width = jsonInt(mon.get("width")) orelse return error.BadMonitorReply,
+        .height = jsonInt(mon.get("height")) orelse return error.BadMonitorReply,
+        .scale = scale,
+    };
+
+    // Copy the name rather than borrow it: the JSON tree it points into is
+    // freed by the caller's `defer parsed.deinit()` before this value is used.
+    if (mon.get("name")) |n| {
+        if (n == .string) {
+            const len: u8 = @intCast(@min(n.string.len, result.name.len));
+            if (len < n.string.len)
+                log.warn("output name '{s}' truncated to {d} bytes", .{ n.string, len });
+            @memcpy(result.name[0..len], n.string[0..len]);
+            result.name_len = len;
+        }
+    }
+    return result;
+}
 
 /// Hyprland's built-in `default` bezier — last-resort easing when the
 /// configured curve can't be resolved from the reply.
@@ -405,6 +512,99 @@ test "parseWorkspaceAnim rejects malformed replies" {
     try std.testing.expectError(error.BadAnimationsReply, parseWorkspaceAnim(std.testing.allocator, "unknown request"));
     try std.testing.expectError(error.BadAnimationsReply, parseWorkspaceAnim(std.testing.allocator, "[[]]"));
     try std.testing.expectError(error.BadAnimationsReply, parseWorkspaceAnim(std.testing.allocator, "[[],[]]"));
+}
+
+// Two monitors side by side. The second is focused and carries the non-zero
+// origin, so the fixture distinguishes "focused" from "first" and logical
+// origin from physical size in one shot.
+const two_monitors =
+    \\[{"id":0,"name":"DP-1","width":3840,"height":2160,"x":0,"y":0,"scale":1.25,"focused":false,"disabled":false},
+    \\ {"id":1,"name":"HDMI-A-1","width":1920,"height":1080,"x":3072,"y":0,"scale":1.0,"focused":true,"disabled":false}]
+;
+
+test "parseMonitor selects by exact name" {
+    const mon = try parseMonitor(std.testing.allocator, two_monitors, "DP-1");
+    try std.testing.expectEqualStrings("DP-1", mon.outputName());
+    try std.testing.expectEqual(@as(i32, 0), mon.x);
+    try std.testing.expectEqual(@as(i32, 3840), mon.width);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), mon.scale, 0.001);
+
+    const other = try parseMonitor(std.testing.allocator, two_monitors, "HDMI-A-1");
+    try std.testing.expectEqualStrings("HDMI-A-1", other.outputName());
+    try std.testing.expectEqual(@as(i32, 3072), other.x);
+}
+
+test "parseMonitor errors rather than falling back on an unknown name" {
+    // Silently substituting monitor[0] would report one monitor's geometry
+    // while the surface landed on another output.
+    try std.testing.expectError(
+        error.MonitorNotFound,
+        parseMonitor(std.testing.allocator, two_monitors, "DP-9"),
+    );
+}
+
+test "parseMonitor without a name prefers the focused monitor over the first" {
+    const mon = try parseMonitor(std.testing.allocator, two_monitors, null);
+    try std.testing.expectEqualStrings("HDMI-A-1", mon.outputName());
+}
+
+test "parseMonitor without a name falls back to the first enabled monitor" {
+    const none_focused =
+        \\[{"name":"DP-1","width":1920,"height":1080,"x":0,"y":0,"scale":1.0,"focused":false},
+        \\ {"name":"DP-2","width":1920,"height":1080,"x":1920,"y":0,"scale":1.0,"focused":false}]
+    ;
+    const mon = try parseMonitor(std.testing.allocator, none_focused, null);
+    try std.testing.expectEqualStrings("DP-1", mon.outputName());
+}
+
+test "parseMonitor skips disabled monitors" {
+    // A disabled monitor has no wl_output, so choosing one guarantees an
+    // OutputNotFound when the layer surface tries to bind it.
+    const with_disabled =
+        \\[{"name":"DP-1","width":1920,"height":1080,"x":0,"y":0,"scale":1.0,"disabled":true},
+        \\ {"name":"DP-2","width":2560,"height":1440,"x":0,"y":0,"scale":1.0,"disabled":false}]
+    ;
+    const mon = try parseMonitor(std.testing.allocator, with_disabled, null);
+    try std.testing.expectEqualStrings("DP-2", mon.outputName());
+    // ...but an explicit name still wins, so a disabled output can be named.
+    const named = try parseMonitor(std.testing.allocator, with_disabled, "DP-1");
+    try std.testing.expectEqualStrings("DP-1", named.outputName());
+}
+
+test "parseMonitor accepts integer and float scales" {
+    const int_scale =
+        \\[{"name":"DP-1","width":1920,"height":1080,"x":0,"y":0,"scale":2}]
+    ;
+    const mon = try parseMonitor(std.testing.allocator, int_scale, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), mon.scale, 0.001);
+
+    const no_scale =
+        \\[{"name":"DP-1","width":1920,"height":1080,"x":0,"y":0}]
+    ;
+    const dflt = try parseMonitor(std.testing.allocator, no_scale, null);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), dflt.scale, 0.001);
+}
+
+test "parseMonitor rejects malformed replies" {
+    try std.testing.expectError(error.BadMonitorReply, parseMonitor(std.testing.allocator, "[]", null));
+    try std.testing.expectError(error.BadMonitorReply, parseMonitor(std.testing.allocator, "{}", null));
+    // A missing coordinate must error, not default to zero: a silent 0 would
+    // put the wallpaper's idea of the origin somewhere it is not.
+    const no_x =
+        \\[{"name":"DP-1","width":1920,"height":1080,"y":0,"scale":1.0}]
+    ;
+    try std.testing.expectError(error.BadMonitorReply, parseMonitor(std.testing.allocator, no_x, null));
+    try std.testing.expectError(error.SyntaxError, parseMonitor(std.testing.allocator, "unknown request", null));
+}
+
+test "parseMonitor truncates an over-long name instead of failing" {
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+    const long = "A" ** 100;
+    const reply = "[{\"name\":\"" ++ long ++ "\",\"width\":1,\"height\":1,\"x\":0,\"y\":0,\"scale\":1.0}]";
+    const mon = try parseMonitor(std.testing.allocator, reply, null);
+    try std.testing.expectEqual(@as(u8, 64), mon.name_len);
+    try std.testing.expectEqualStrings(long[0..64], mon.outputName());
 }
 
 fn jsonIntPair(val: ?std.json.Value) ?[2]i32 {

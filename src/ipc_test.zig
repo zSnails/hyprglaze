@@ -9,7 +9,7 @@ const watcher_lua = @embedFile("core/watcher.lua");
 /// Diagnostic for the push pipeline: installs the in-compositor Lua
 /// watcher, then prints the pushed cursor/window state for ~10 seconds.
 /// Move the cursor and drag windows — the numbers should follow live.
-pub fn main() !void {
+pub fn main(init: std.process.Init.Minimal) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = if (builtin.mode == .Debug) gpa.allocator() else std.heap.smp_allocator;
@@ -30,9 +30,15 @@ pub fn main() !void {
         return err;
     };
 
-    // One-shot monitor info (startup-only query, same as the daemon)
-    const mon = try ipc.primaryMonitor(allocator);
-    try stdout.print("Monitor: {d}x{d} at ({d},{d})\n", .{ mon.width, mon.height, mon.x, mon.y });
+    // One-shot monitor info (startup-only query, same as the daemon).
+    // argv[1], when given, names the output to scope to — the same selection
+    // the daemon's --output performs.
+    const argv = init.args.vector;
+    const want: ?[]const u8 = if (argv.len > 1) std.mem.span(argv[1]) else null;
+    const mon = try ipc.monitor(allocator, want);
+    try stdout.print("Monitor: {s} {d}x{d} at ({d},{d}) scale={d:.2}\n", .{
+        mon.outputName(), mon.width, mon.height, mon.x, mon.y, mon.scale,
+    });
 
     var events = try hypr_events.HyprEvents.init();
     try events.start();

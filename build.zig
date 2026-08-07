@@ -38,12 +38,9 @@ pub fn build(b: *std.Build) void {
     // Generated protocol headers
     exe.root_module.addIncludePath(wl_protocols.include_path);
     // Generated protocol C sources
-    exe.root_module.addCSourceFile(.{
-        .file = wl_protocols.xdg_shell_c,
-    });
-    exe.root_module.addCSourceFile(.{
-        .file = wl_protocols.layer_shell_c,
-    });
+    for (wl_protocols.sources) |src| {
+        exe.root_module.addCSourceFile(.{ .file = src });
+    }
 
     // stb_image implementation
     exe.root_module.addCSourceFile(.{
@@ -111,31 +108,51 @@ pub fn build(b: *std.Build) void {
 
 const WaylandProtocols = struct {
     include_path: std.Build.LazyPath,
-    xdg_shell_c: std.Build.LazyPath,
-    layer_shell_c: std.Build.LazyPath,
+    /// Generated protocol implementations, added to the module as C sources.
+    sources: []const std.Build.LazyPath,
 };
 
 fn generateWaylandProtocols(b: *std.Build) WaylandProtocols {
-    const xdg_shell_xml = b.path("protocols/xdg-shell.xml");
-    const layer_shell_xml = b.path("protocols/wlr-layer-shell-unstable-v1.xml");
+    // basename -> the header/source names wayland-scanner conventionally
+    // produces for it. Adding a protocol is one entry.
+    const protocols = [_]struct { xml: []const u8, header: []const u8, source: []const u8 }{
+        .{
+            .xml = "protocols/xdg-shell.xml",
+            .header = "xdg-shell-client-protocol.h",
+            .source = "xdg-shell-protocol.c",
+        },
+        .{
+            .xml = "protocols/wlr-layer-shell-unstable-v1.xml",
+            .header = "wlr-layer-shell-unstable-v1-client-protocol.h",
+            .source = "wlr-layer-shell-unstable-v1-protocol.c",
+        },
+        // Needed together: fractional-scale reports the compositor's preferred
+        // scale, viewporter is how the resulting buffer is mapped back onto
+        // the surface's logical size.
+        .{
+            .xml = "protocols/viewporter.xml",
+            .header = "viewporter-client-protocol.h",
+            .source = "viewporter-protocol.c",
+        },
+        .{
+            .xml = "protocols/fractional-scale-v1.xml",
+            .header = "fractional-scale-v1-client-protocol.h",
+            .source = "fractional-scale-v1-protocol.c",
+        },
+    };
 
-    // Generate client headers
-    const xdg_shell_header = runScanner(b, "client-header", xdg_shell_xml, "xdg-shell-client-protocol.h");
-    const layer_shell_header = runScanner(b, "client-header", layer_shell_xml, "wlr-layer-shell-unstable-v1-client-protocol.h");
-
-    // Generate C source (private-code for static linking)
-    const xdg_shell_c = runScanner(b, "private-code", xdg_shell_xml, "xdg-shell-protocol.c");
-    const layer_shell_c = runScanner(b, "private-code", layer_shell_xml, "wlr-layer-shell-unstable-v1-protocol.c");
-
-    // Create a write-files step to collect headers into a single include dir
     const wf = b.addWriteFiles();
-    _ = wf.addCopyFile(xdg_shell_header, "xdg-shell-client-protocol.h");
-    _ = wf.addCopyFile(layer_shell_header, "wlr-layer-shell-unstable-v1-client-protocol.h");
+    var sources = b.allocator.alloc(std.Build.LazyPath, protocols.len) catch @panic("OOM");
+
+    for (protocols, 0..) |p, i| {
+        const xml = b.path(p.xml);
+        _ = wf.addCopyFile(runScanner(b, "client-header", xml, p.header), p.header);
+        sources[i] = runScanner(b, "private-code", xml, p.source);
+    }
 
     return .{
         .include_path = wf.getDirectory(),
-        .xdg_shell_c = xdg_shell_c,
-        .layer_shell_c = layer_shell_c,
+        .sources = sources,
     };
 }
 

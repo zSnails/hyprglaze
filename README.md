@@ -6,7 +6,8 @@ A wallpaper daemon for Hyprland that renders GLSL shaders and modular effects on
 
 ## Features
 
-- Renders behind all windows via wlr-layer-shell
+- Renders behind all windows via wlr-layer-shell, on a chosen monitor or one instance per monitor
+- Draws at the monitor's native resolution on scaled displays, via fractional-scale and viewporter
 - Shadertoy-compatible GLSL uniforms (iResolution, iTime, iMouse, iWindow)
 - Passes every visible window to shaders with smooth position tracking and identity-based focus
 - Receives compositor state as push events from a small Lua watcher installed inside Hyprland, so geometry stays live even mid-drag and nothing is ever polled
@@ -75,6 +76,7 @@ zig build run
 #          voltaic, moire, fable, ivy, whorl, weft, crystal, fur
 effect = "fluid"
 theme = "Rosé Pine"
+# output = "DP-1"     # monitor to render on; default is the focused one
 
 [fur]
 # spacing = 23.0      # follicle spacing in px; finer shimmers and reads as noise
@@ -152,6 +154,7 @@ contour = false       # true = topographic isoline mode instead of blocks
 
 ```
 hyprglaze --effect fire --theme "Rosé Pine"
+hyprglaze --output DP-1           # render on a specific monitor
 hyprglaze --list-effects          # list available effects
 hyprglaze --list-themes           # list available themes
 hyprglaze --set-theme "Nord"      # persist a theme to the config file (hot-reloads)
@@ -159,6 +162,56 @@ hyprglaze --help                  # full flag reference
 ```
 
 From source: substitute `zig build run --` for `hyprglaze`.
+
+### Multiple monitors
+
+Without `--output` the wallpaper lands on the monitor that has focus at
+startup. Name one explicitly with `--output` (or `output = "..."` in the
+config) using the names from `hyprctl monitors -j | jq -r '.[].name'`. An
+unknown name is an error listing the outputs that do exist, rather than a
+silent fall back to the wrong screen. Changing it needs a restart — the
+surface is bound to its output when it is created — so a live config reload
+logs a warning instead of pretending to apply.
+
+For a wallpaper on every monitor, run one instance per monitor — from
+`hyprland.lua`:
+
+```lua
+hl.on("hyprland.start", function()
+    hl.exec_cmd("hyprglaze --output DP-1 &")
+    hl.exec_cmd("hyprglaze --output HDMI-A-1 &")
+end)
+```
+
+A templated systemd unit is packaged as well:
+
+```
+systemctl --user enable --now hyprglaze@DP-1 hyprglaze@HDMI-A-1
+```
+
+but it is `WantedBy=graphical-session.target`, which only something like uwsm
+reaches. If Hyprland is started directly, from a display manager or a
+`start-hyprland` script, that target is never activated, so the units run once
+because of `--now` and are gone after the next login. Use the `exec_cmd` form
+there.
+
+One thing the unit buys that `exec_cmd` does not: when a monitor is unplugged,
+the instance pinned to it exits non-zero, and `Restart=on-failure` brings the
+wallpaper back when the monitor returns. Launched bare from `exec_cmd` nothing
+supervises it, so that screen stays empty until you rerun the command. If you
+care about hotplug and cannot reach `graphical-session.target`, wrap the
+launch in a loop:
+
+```lua
+hl.exec_cmd("sh -c 'while :; do hyprglaze --output DP-1; sleep 5; done' &")
+```
+
+Each instance tracks only its own monitor's windows and cursor, and its
+effects see coordinates relative to that monitor. They share a single Lua
+watcher inside Hyprland — one 16ms timer no matter how many instances run —
+so the compositor-side cost does not grow as you add screens. Don't enable
+`hyprglaze.service` alongside `hyprglaze@.service` for the same screen; both
+would render on it.
 
 ### Audio effects
 
@@ -188,6 +241,8 @@ Requires the `aws` CLI and model access enabled for `us.anthropic.claude-haiku-4
 Most Hyprland companions poll the IPC socket for state. hyprglaze instead installs `src/core/watcher.lua` into the compositor's Lua VM at startup (and again after every config reload, which recreates that VM). The watcher runs a 16ms timer inside Hyprland, reads cursor and window state directly from compositor memory, and emits compact `custom>>hg:*` events on the socket2 event stream, but only when something actually changed.
 
 The daemon holds a single socket2 connection and receives everything as push: cursor moves, window geometry (including mid-drag, which Hyprland otherwise never reports), and a heartbeat. If the heartbeat stops, the daemon reinstalls the watcher automatically. Steady state with nothing moving is zero IPC traffic and zero wakeups on the Hyprland side beyond the timer tick.
+
+The watcher emits one geometry event per monitor, carrying that monitor's active workspace, its layout origin, and its window strip; each daemon keeps only the events for its own output. So a second instance costs nothing on the compositor side — the install is idempotent and there is still exactly one timer — and because the origin travels in the same event as the rects it describes, a monitor that moves can never leave a daemon rebasing windows against a stale origin.
 
 `zig build ipc-test` runs a standalone diagnostic that installs the watcher and prints the pushed state live.
 

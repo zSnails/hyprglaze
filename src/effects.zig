@@ -152,6 +152,15 @@ pub const Effect = union(enum) {
         }
     }
 
+    /// CLI-style name of the live variant (`ai_buddy` -> `ai-buddy`), so a
+    /// caller can rebuild the same effect without going through config state
+    /// that may have drifted from what is actually running.
+    pub fn cliNameOf(self: *const Effect) []const u8 {
+        return switch (self.*) {
+            inline else => |_, tag| comptime cliName(@tagName(tag)),
+        };
+    }
+
     /// Fragment shader an effect loads by default: shaders/<variant>.frag,
     /// except ai_buddy which renders with buddy's frag.
     pub fn defaultShader(self: *const Effect) []const u8 {
