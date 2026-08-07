@@ -129,11 +129,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return err;
     };
 
-    const mon = ipc.getMonitor(allocator, cli.output) catch |err| {
-        log.err("failed to query monitor: {}", .{err});
+    const mon = ipc.monitor(allocator, cfg.output) catch |err| {
+        if (err == error.MonitorNotFound) {
+            log.err("no output named '{s}'", .{cfg.output.?});
+            ipc.logMonitorNames(allocator);
+        } else {
+            log.err("failed to query monitor: {}", .{err});
+        }
         return err;
     };
-    log.info("monitor: {d}x{d} scale={d:.2}, position = ({d}, {d})", .{ mon.width, mon.height, mon.scale, mon.x, mon.y });
+    log.info("output: {s} {d}x{d} @({d},{d}) scale={d:.2}", .{
+        mon.outputName(), mon.width, mon.height, mon.x, mon.y, mon.scale,
+    });
 
     // Detect Hyprland's workspace animation so switches mirror the
     // compositor's own slide (direction, duration, easing). Refreshed on
@@ -154,14 +161,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Wayland. Two-phase init: `wl`'s address becomes listener userdata,
     // so it must live here, not in a temporary inside init().
     var wl: wayland.WaylandState = undefined;
-    wl.init(allocator, cli.output) catch |err| {
+    wl.init(mon.outputName()) catch |err| {
         log.err("Wayland init failed: {}", .{err});
         return err;
     };
     defer wl.deinit();
 
     wl.createLayerSurface() catch |err| {
-        log.err("layer surface creation failed: {}", .{err});
+        if (err == error.OutputNotFound) {
+            // Hyprland knows this monitor but Wayland does not advertise a
+            // matching output — the discrepancy between the two lists is the
+            // diagnosis, so print both.
+            log.err("Hyprland reports output '{s}' but no matching wl_output exists", .{mon.outputName()});
+            wl.logOutputNames();
+        } else {
+            log.err("layer surface creation failed: {}", .{err});
+        }
         return err;
     };
 
@@ -348,7 +363,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (config_watcher) |*cw| {
             if (cw.poll()) {
                 log.info("config changed, reloading", .{});
-                reloadConfig(allocator, &cfg, &effect, &shader_prog, &pal, &trans, &shader_path_expanded, surf_w, surf_h) catch |err| {
+                reloadConfig(allocator, &cfg, &effect, &shader_prog, &pal, &trans, &shader_path_expanded, surf_w, surf_h, mon.outputName()) catch |err| {
                     log.warn("reload failed: {}", .{err});
                 };
                 configureSlide(&slide, detected_anim, &cfg);
@@ -808,10 +823,13 @@ fn loadConfig(allocator: std.mem.Allocator, cli: *const CliArgs) !config_mod.Con
             errdefer allocator.free(shader_dup);
             const theme_dup = if (cli.theme_name) |t| try allocator.dupe(u8, t) else null;
             errdefer if (theme_dup) |td| allocator.free(td);
+            const output_dup = if (cli.output) |o| try allocator.dupe(u8, o) else null;
+            errdefer if (output_dup) |od| allocator.free(od);
             return .{
                 .effect = effect_dup,
                 .shader = shader_dup,
                 .theme = theme_dup,
+                .output = output_dup,
                 .transition_duration = 0.3,
                 .cursor_smoothing = 0.15,
                 .geometry_smoothing = 0.12,
@@ -838,6 +856,10 @@ fn loadConfig(allocator: std.mem.Allocator, cli: *const CliArgs) !config_mod.Con
         if (cfg.theme) |old| allocator.free(old);
         cfg.theme = try allocator.dupe(u8, tn);
     }
+    if (cli.output) |o| {
+        if (cfg.output) |old| allocator.free(old);
+        cfg.output = try allocator.dupe(u8, o);
+    }
 
     return cfg;
 }
@@ -852,12 +874,23 @@ fn reloadConfig(
     current_shader_path: *[]const u8,
     surf_w: f32,
     surf_h: f32,
+    active_output: []const u8,
 ) !void {
     var new_cfg = try config_mod.load(allocator, cfg.config_path);
 
     trans.transition_duration = new_cfg.transition_duration;
     trans.cursor_smoothing = new_cfg.cursor_smoothing;
     trans.geometry_smoothing = new_cfg.geometry_smoothing;
+
+    // The layer surface is bound to its output when it is created, so this
+    // one cannot hot-apply. Compare against the output actually in use rather
+    // than against cfg.output: a reload re-reads the file without re-applying
+    // CLI overrides, so cfg.output would report the file's value even when
+    // --output won at startup.
+    if (new_cfg.output) |want| {
+        if (!std.mem.eql(u8, want, active_output))
+            log.warn("output changed to '{s}' — restart hyprglaze to apply", .{want});
+    }
 
     // Theme change
     if (!strEql(cfg.theme, new_cfg.theme)) {
@@ -940,7 +973,8 @@ const usage_text =
     \\
     \\Usage: hyprglaze [options]
     \\
-    \\  --output NAME      Output/monitor name to render to (default: first available)
+    \\  --output NAME      Monitor to render on, per `hyprctl monitors`
+    \\                     (default: the focused monitor at startup)
     \\  --config PATH      TOML config path (default: ~/.config/hypr/hyprglaze.toml)
     \\  --effect NAME      Effect to render (see --list-effects)
     \\  --shader PATH      Fragment shader path (overrides effect default)

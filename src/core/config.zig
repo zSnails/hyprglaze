@@ -78,6 +78,10 @@ pub const Config = struct {
     effect: []const u8,
     shader: []const u8,
     theme: ?[]const u8,
+    /// `output` — name of the monitor to render on, as reported by
+    /// `hyprctl monitors`. null = the focused monitor at startup. Bound when
+    /// the layer surface is created, so a change needs a restart.
+    output: ?[]const u8,
     transition_duration: f32,
     cursor_smoothing: f32,
     geometry_smoothing: f32,
@@ -139,6 +143,7 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8, source_path: []cons
     const effect_name = if (t.get("effect")) |v| (if (v == .string) v.string else "particles") else "particles";
     const shader_str = if (t.get("shader")) |v| (if (v == .string) v.string else "") else "";
     const theme_str = if (t.get("theme")) |v| (if (v == .string) v.string else null) else null;
+    const output_str = if (t.get("output")) |v| (if (v == .string) v.string else null) else null;
 
     // Read core sections
     const transition_params = effectParamsFromTable(t, "transition");
@@ -151,11 +156,14 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8, source_path: []cons
     errdefer allocator.free(shader_dup);
     const theme_dup = if (theme_str) |ts| try allocator.dupe(u8, ts) else null;
     errdefer if (theme_dup) |td| allocator.free(td);
+    const output_dup = if (output_str) |os| try allocator.dupe(u8, os) else null;
+    errdefer if (output_dup) |od| allocator.free(od);
 
     return .{
         .effect = effect_dup,
         .shader = shader_dup,
         .theme = theme_dup,
+        .output = output_dup,
         .transition_duration = transition_params.getFloat("duration", 0.3),
         .cursor_smoothing = cursor_params.getFloat("smoothing", 0.15),
         .geometry_smoothing = geometry_params.getFloat("smoothing", 0.12),
@@ -221,6 +229,7 @@ pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
     allocator.free(self.effect);
     if (self.shader.len > 0) allocator.free(self.shader);
     if (self.theme) |t2| allocator.free(t2);
+    if (self.output) |o| allocator.free(o);
     allocator.free(self.config_path);
     if (self.raw_arena) |*arena| arena.deinit();
 }

@@ -1,5 +1,4 @@
 const std = @import("std");
-const hypr = @import("hypr.zig");
 
 const c = @cImport({
     @cInclude("wayland-client.h");
@@ -8,7 +7,29 @@ const c = @cImport({
     @cInclude("wlr-layer-shell-unstable-v1-client-protocol.h");
 });
 
-const log = std.log.scoped(.wayland_state);
+const log = std.log.scoped(.wayland);
+
+/// Plenty for any real desk, and small enough to live inline. A fixed array
+/// rather than an ArrayList because the registry callback is `callconv(.c)`
+/// and has nowhere to report an allocation failure — and because it keeps
+/// `deinit` heap-free, as it has always been.
+const max_outputs = 16;
+const max_output_name = 32;
+
+const OutputEntry = struct {
+    proxy: *c.wl_output,
+    /// Registry name, needed to match the `global_remove` event.
+    global: u32,
+    /// Copied, never borrowed: the `name` event's string argument lives in
+    /// libwayland's message buffer and is reused the moment the callback
+    /// returns.
+    name: [max_output_name]u8 = undefined,
+    name_len: u8 = 0,
+
+    fn outputName(self: *const OutputEntry) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
 
 pub const WaylandState = struct {
     display: *c.wl_display,
@@ -18,8 +39,18 @@ pub const WaylandState = struct {
     surface: ?*c.wl_surface = null,
     layer_surface: ?*c.zwlr_layer_surface_v1 = null,
     egl_window: ?*c.wl_egl_window = null,
-    allocator: std.mem.Allocator,
-    monitors: std.ArrayList(hypr.MonitorInfo),
+
+    /// Output the layer surface is pinned to, copied inline. Empty = let the
+    /// compositor choose. Must survive `reconnect`, so it is carried through
+    /// the struct literal in `connect` rather than defaulted.
+    target_name: [max_output_name]u8 = undefined,
+    target_len: u8 = 0,
+
+    outputs: [max_outputs]OutputEntry = undefined,
+    output_count: u8 = 0,
+    /// Our target output was removed from the registry. The compositor also
+    /// closes the layer surface, so this exists purely so main can say why.
+    target_gone: bool = false,
 
     configured: bool = false,
     width: u31 = 0,
@@ -27,65 +58,87 @@ pub const WaylandState = struct {
     should_close: bool = false,
     frame_done: bool = true,
     resize_pending: bool = false,
-    must_use_monitor: ?[]const u8 = null,
 
-    /// Two-phase init: `self` must be caller-owned storage that outlives
-    /// the connection, because its address is registered as listener
-    /// userdata — registry events (e.g. monitor hotplug) arrive through
-    /// that pointer for the lifetime of the display.
-    pub fn init(self: *WaylandState, allocator: std.mem.Allocator, monitor_name: ?[]const u8) !void {
+    pub fn targetName(self: *const WaylandState) []const u8 {
+        return self.target_name[0..self.target_len];
+    }
+
+    /// Connect, bind globals, and learn every output's name. Shared by `init`
+    /// and `reconnect` so the two can never drift — the pin was previously
+    /// lost on reconnect because only the initial path did the second
+    /// roundtrip.
+    fn connect(self: *WaylandState) !void {
         const display = c.wl_display_connect(null) orelse return error.DisplayConnectFailed;
         errdefer c.wl_display_disconnect(display);
         const registry = c.wl_display_get_registry(display) orelse return error.RegistryFailed;
         errdefer c.wl_registry_destroy(registry);
 
-        var monitors = try std.ArrayList(hypr.MonitorInfo).initCapacity(allocator, 2);
-        errdefer monitors.deinit(allocator);
-
+        // Whole-struct reset: every field NOT named here reverts to its
+        // default. Anything that must outlive a reconnect belongs in this
+        // literal — which is why the target is here and not restored around
+        // the assignment.
         self.* = .{
             .display = display,
             .registry = registry,
-            .allocator = allocator,
-            .monitors = monitors,
-            .must_use_monitor = monitor_name,
+            .target_name = self.target_name,
+            .target_len = self.target_len,
         };
 
         if (c.wl_registry_add_listener(registry, &registry_listener, self) != 0)
             return error.RegistryListenerFailed;
 
-        // Round-trip to get globals
+        // First roundtrip: the globals arrive and wl_output proxies get bound.
         if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
-
-        // NOTE: this roundtrip is needed, the previous one gets the globals,
-        // this one gets the output display geometry, name, mode, etc. It has
-        // to stay.
+        // Second roundtrip: wl_output.name (v4) is only sent in response to
+        // the bind above, so it cannot have arrived during the first. Without
+        // this the output table holds proxies with empty names and every match
+        // fails.
         if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
 
         if (self.compositor == null) return error.NoCompositor;
         if (self.layer_shell == null) return error.NoLayerShell;
     }
 
-    fn getMonitor(self: *WaylandState) ?*c.wl_output {
-        if (self.must_use_monitor) |must_use_monitor| {
-            for (self.monitors.items) |mon| {
-                if (std.mem.eql(u8, mon.name, must_use_monitor)) {
-                    return @ptrCast(mon.output);
-                }
-            }
+    /// Two-phase init: `self` must be caller-owned storage that outlives
+    /// the connection, because its address is registered as listener
+    /// userdata — registry events (e.g. monitor hotplug) arrive through
+    /// that pointer for the lifetime of the display.
+    ///
+    /// `output_name` is empty to let the compositor pick.
+    pub fn init(self: *WaylandState, output_name: []const u8) !void {
+        self.target_len = @intCast(@min(output_name.len, max_output_name));
+        @memcpy(self.target_name[0..self.target_len], output_name[0..self.target_len]);
+        try self.connect();
+    }
+
+    fn targetOutput(self: *const WaylandState) ?*c.wl_output {
+        if (self.target_len == 0) return null;
+        for (self.outputs[0..self.output_count]) |*e| {
+            if (std.mem.eql(u8, e.outputName(), self.targetName())) return e.proxy;
         }
         return null;
     }
 
+    /// Names of every output the compositor advertises, for diagnostics.
+    pub fn logOutputNames(self: *const WaylandState) void {
+        for (self.outputs[0..self.output_count]) |*e|
+            log.info("  wayland output: {s}", .{e.outputName()});
+    }
+
     pub fn createLayerSurface(self: *WaylandState) !void {
+        const out = self.targetOutput();
+        // A requested output that no longer exists must fail loudly. Falling
+        // through to the compositor's choice would put the wallpaper on one
+        // monitor while every coordinate was rebased against another.
+        if (self.target_len != 0 and out == null) return error.OutputNotFound;
+
         self.surface = c.wl_compositor_create_surface(self.compositor) orelse
             return error.SurfaceCreateFailed;
-
-        const monitor = self.getMonitor();
 
         self.layer_surface = c.zwlr_layer_shell_v1_get_layer_surface(
             self.layer_shell,
             self.surface,
-            monitor,
+            out, // null only when no output was requested
             c.ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND,
             "hyprglaze",
         ) orelse return error.LayerSurfaceCreateFailed;
@@ -142,39 +195,38 @@ pub const WaylandState = struct {
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
+        // Release the old proxies before the display goes: they belong to the
+        // connection being torn down, and `connect` rebuilds the table from
+        // the new registry.
+        self.releaseOutputs();
         c.wl_registry_destroy(self.registry);
         c.wl_display_disconnect(self.display);
 
-        const display = c.wl_display_connect(null) orelse return error.DisplayConnectFailed;
-        const registry = c.wl_display_get_registry(display) orelse return error.RegistryFailed;
-
-        self.* = .{
-            .display = display,
-            .registry = registry,
-            .allocator = self.allocator,
-            .monitors = self.monitors,
-        };
-
-        if (c.wl_registry_add_listener(registry, &registry_listener, self) != 0)
-            return error.RegistryListenerFailed;
-        if (c.wl_display_roundtrip(display) == -1) return error.RoundtripFailed;
-        if (self.compositor == null) return error.NoCompositor;
-        if (self.layer_shell == null) return error.NoLayerShell;
-
+        try self.connect();
         try self.createLayerSurface();
         if (!self.configured) return error.NotConfigured;
         try self.createEglWindow();
+    }
+
+    fn releaseOutputs(self: *WaylandState) void {
+        for (self.outputs[0..self.output_count]) |*e| releaseOutput(e.proxy);
+        self.output_count = 0;
     }
 
     pub fn deinit(self: *WaylandState) void {
         if (self.egl_window) |win| c.wl_egl_window_destroy(win);
         if (self.layer_surface) |ls| c.zwlr_layer_surface_v1_destroy(ls);
         if (self.surface) |s| c.wl_surface_destroy(s);
-        self.monitors.deinit(self.allocator);
+        self.releaseOutputs();
         c.wl_registry_destroy(self.registry);
         c.wl_display_disconnect(self.display);
     }
 };
+
+/// wl_output.release is a v3 destructor; below that only destroy exists.
+fn releaseOutput(proxy: *c.wl_output) void {
+    if (c.wl_output_get_version(proxy) >= 3) c.wl_output_release(proxy) else c.wl_output_destroy(proxy);
+}
 
 // --- Registry listener ---
 
@@ -198,53 +250,75 @@ fn registryGlobal(
     } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
         state.layer_shell = @ptrCast(c.wl_registry_bind(registry, name, &c.zwlr_layer_shell_v1_interface, @min(version, 1)));
     } else if (std.mem.eql(u8, iface, "wl_output")) {
-        // NOTE: I'm not storing this output, this output is the
-        const output: *c.wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, @min(version, 4)));
-        if (c.wl_output_add_listener(output, &output_listener, data) != 0) {
-            log.err("something went wrong when registering the output listener, a default output will be used if available", .{});
+        // The connector name (DP-1, HDMI-A-1) only exists from v4. Below that
+        // there is nothing to match --output against.
+        if (version < 4) {
+            log.warn("compositor offers wl_output v{d}; --output needs v4 for the name event", .{version});
+            return;
         }
+        if (state.output_count >= max_outputs) {
+            log.warn("more than {d} outputs; ignoring the rest", .{max_outputs});
+            return;
+        }
+        const proxy_opt: ?*c.wl_output = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, 4));
+        const proxy = proxy_opt orelse return;
+        state.outputs[state.output_count] = .{ .proxy = proxy, .global = name };
+        state.output_count += 1;
+        _ = c.wl_output_add_listener(proxy, &output_listener, state);
     }
 }
 
-fn registryGlobalRemove(_: ?*anyopaque, _: ?*c.wl_registry, _: u32) callconv(.c) void {}
-
-// --- Output listener --
-
-var temp_monitor: hypr.MonitorInfo = undefined;
-
-fn outputHandleGeometry(_: ?*anyopaque, _: ?*c.wl_output, x: i32, y: i32, _: i32, _: i32, _: i32, _: [*c]const u8, _: [*c]const u8, _: i32) callconv(.c) void {
-    temp_monitor.x = x;
-    temp_monitor.y = y;
-}
-
-fn outputHandleMode(_: ?*anyopaque, _: ?*c.wl_output, _: u32, width: i32, height: i32, _: i32) callconv(.c) void {
-    temp_monitor.width = width;
-    temp_monitor.height = height;
-}
-
-fn outputHandleDone(data: ?*anyopaque, output: ?*c.wl_output) callconv(.c) void {
+fn registryGlobalRemove(data: ?*anyopaque, _: ?*c.wl_registry, name: u32) callconv(.c) void {
     const state: *WaylandState = @ptrCast(@alignCast(data));
-    temp_monitor.output = @ptrCast(output);
-    state.monitors.append(state.allocator, temp_monitor) catch unreachable;
+    var i: u8 = 0;
+    while (i < state.output_count) : (i += 1) {
+        if (state.outputs[i].global != name) continue;
+        const gone = state.outputs[i];
+        if (state.target_len != 0 and std.mem.eql(u8, gone.outputName(), state.targetName()))
+            state.target_gone = true;
+        releaseOutput(gone.proxy);
+        state.outputs[i] = state.outputs[state.output_count - 1]; // swap-remove
+        state.output_count -= 1;
+        return;
+    }
 }
 
-fn outputHandleScale(_: ?*anyopaque, _: ?*c.wl_output, scale: i32) callconv(.c) void {
-    temp_monitor.scale = @floatFromInt(scale);
-}
+// --- Output listener ---
+//
+// Only the name is kept. Every geometric quantity comes from `j/monitors`
+// (logical layout coords) or from the layer-surface configure; wl_output's
+// geometry/mode are *physical* pixels, so storing them would only invite
+// someone to mix the two units later.
+//
+// libwayland dispatches through this table unconditionally, so every member
+// must be non-null even when we ignore the event.
 
-fn outputHandleName(_: ?*anyopaque, _: ?*c.wl_output, name: [*c]const u8) callconv(.c) void {
-    temp_monitor.name = std.mem.span(name);
-}
+fn outputGeometry(_: ?*anyopaque, _: ?*c.wl_output, _: i32, _: i32, _: i32, _: i32, _: i32, _: [*c]const u8, _: [*c]const u8, _: i32) callconv(.c) void {}
+fn outputMode(_: ?*anyopaque, _: ?*c.wl_output, _: u32, _: i32, _: i32, _: i32) callconv(.c) void {}
+fn outputDone(_: ?*anyopaque, _: ?*c.wl_output) callconv(.c) void {}
+fn outputScale(_: ?*anyopaque, _: ?*c.wl_output, _: i32) callconv(.c) void {}
+fn outputDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
 
-fn outputHandleDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
+fn outputName(data: ?*anyopaque, output: ?*c.wl_output, name: [*c]const u8) callconv(.c) void {
+    const state: *WaylandState = @ptrCast(@alignCast(data));
+    const proxy = output orelse return;
+    // Valid only for the duration of this call — copy, never retain.
+    const s = std.mem.span(name orelse return);
+    for (state.outputs[0..state.output_count]) |*e| {
+        if (e.proxy != proxy) continue;
+        e.name_len = @intCast(@min(s.len, max_output_name));
+        @memcpy(e.name[0..e.name_len], s[0..e.name_len]);
+        return;
+    }
+}
 
 const output_listener = c.wl_output_listener{
-    .geometry = outputHandleGeometry,
-    .mode = outputHandleMode,
-    .done = outputHandleDone,
-    .scale = outputHandleScale,
-    .name = outputHandleName,
-    .description = outputHandleDescription,
+    .geometry = outputGeometry,
+    .mode = outputMode,
+    .done = outputDone,
+    .scale = outputScale,
+    .name = outputName,
+    .description = outputDescription,
 };
 
 // --- Layer surface listener ---
